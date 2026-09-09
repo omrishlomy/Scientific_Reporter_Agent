@@ -1,9 +1,11 @@
-# Paper digest bot
+# Scientific Reporter Agent
 
 Cloud-hosted version of the weekly paper digest -- runs on GitHub Actions instead of a
 local PC, so it can't miss a Monday because a machine was off. Synthesis runs on a
 self-hosted open-weights model (Qwen2.5-7B-Instruct, quantized) rather than a personal
 Claude login, since Actions runners need to authenticate as themselves, not as you.
+
+Repo: https://github.com/omrishlomy/Scientific_Reporter_Agent
 
 ## Why this is its own repo, separate from the research repo
 
@@ -31,29 +33,20 @@ and the pipeline code itself.
   `/topics` commands and commits changes to `topics.yaml`. Deliberately simple/rule-based,
   not LLM-backed -- see the comment at the top of `reporter/bot_poll.py` for why.
 
-## One-time setup (you do this part -- account/repo creation isn't something Claude does on your behalf)
+## Setup status
 
-1. **Create a new GitHub repo**, public, e.g. named `paper-digest-bot`. (github.com ->
-   New repository -> do not initialize with a README, since this folder already has one.)
-2. From this folder:
-   ```bash
-   git init
-   git add .
-   git commit -m "Initial commit"
-   git branch -M main
-   git remote add origin https://github.com/<your-username>/paper-digest-bot.git
-   git push -u origin main
-   ```
-3. **Add two repo secrets** (repo -> Settings -> Secrets and variables -> Actions ->
-   New repository secret):
-   - `TELEGRAM_BOT_TOKEN` -- the same token from `@BotFather` used for the local setup
-   - `TELEGRAM_CHAT_ID` -- your chat id (same one `setup-telegram.ps1` auto-detected;
-     see `telegram-config.json` on the PC if you need to look it up again)
-4. Enable Actions on the repo if prompted (first-time repos sometimes need this
-   confirmed explicitly under the Actions tab).
-5. Trigger the reporter once manually to confirm it works end to end: Actions tab ->
-   "Weekly paper digest" -> Run workflow. Expect it to take a while (see below) --
-   CPU-only inference on a free runner is not fast.
+- [x] Repo created (public, github.com/omrishlomy) and pushed.
+- [ ] **Add two repo secrets** -- repo -> Settings -> Secrets and variables -> Actions ->
+  New repository secret. This step needs you: entering tokens/credentials isn't
+  something Claude does on your behalf, even into a form field.
+  - `TELEGRAM_BOT_TOKEN` -- the same token from `@BotFather` used for the local PC setup
+  - `TELEGRAM_CHAT_ID` -- your chat id (the one `setup-telegram.ps1` auto-detected on
+    the PC; check `telegram-config.json` there if you need to look it up again)
+- [ ] Confirm Actions is enabled on the repo (Actions tab -- first-time repos sometimes
+  need this confirmed explicitly).
+- [ ] Trigger the reporter once manually to confirm it works end to end: Actions tab ->
+  "Weekly paper digest" -> Run workflow. Expect it to take a while (see below) --
+  CPU-only inference on a free runner is not fast.
 
 Once confirmed working, you can retire the Windows Scheduled Task
 (`ClaudeAgent-Reporter`) on the PC -- this repo replaces it. The download-filer agent
