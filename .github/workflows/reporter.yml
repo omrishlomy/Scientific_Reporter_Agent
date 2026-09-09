@@ -1,0 +1,103 @@
+name: Weekly paper digest
+
+on:
+  schedule:
+    # Monday 08:00 Israel time. GitHub Actions cron is always UTC and does not shift
+    # for daylight saving, so this comment is the source of truth if the offset drifts
+    # -- IDT is UTC+3 (summer) / IST is UTC+2 (winter); 05:00 UTC covers the summer
+    # case (08:00 IDT). Adjust by an hour around the clock-change weekends if it matters.
+    - cron: '0 5 * * 1'
+  workflow_dispatch: {}   # lets you trigger a run manually from the Actions tab
+
+permissions:
+  contents: write   # needed to commit updated seen.json back to the repo
+
+concurrency:
+  group: reporter
+  cancel-in-progress: false
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90   # generous headroom for CPU-only inference on a free runner
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install Python dependencies
+        run: pip install -r requirements.txt
+
+      - name: Resolve latest llama.cpp CPU build
+        id: llamacpp
+        run: |
+          TAG=$(curl -sL https://github.com/ggml-org/llama.cpp/releases/latest/download/nightly-tag.txt)
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+
+      - name: Cache llama.cpp binary
+        id: cache-llamacpp
+        uses: actions/cache@v4
+        with:
+          path: llamacpp-bin
+          key: llamacpp-${{ steps.llamacpp.outputs.tag }}-ubuntu-x64
+
+      - name: Download llama.cpp CPU build
+        if: steps.cache-llamacpp.outputs.cache-hit != 'true'
+        run: |
+          mkdir -p llamacpp-bin
+          curl -sL "https://github.com/ggml-org/llama.cpp/releases/download/${{ steps.llamacpp.outputs.tag }}/llama-${{ steps.llamacpp.outputs.tag }}-bin-ubuntu-x64.tar.gz" \
+            -o llamacpp.tar.gz
+          # The archive's own top-level dir is llama-<tag>/ -- confirmed against the
+          # real tarball; it is NOT a build/bin/ CMake-install layout.
+          tar -xzf llamacpp.tar.gz -C llamacpp-bin
+
+      # Model weights are cached across runs so a normal week doesn't re-download
+      # ~4.7GB from Hugging Face -- only the first run (or a cache eviction) pays that
+      # cost. Swap the URL/key here to change models later.
+      - name: Cache model weights
+        id: cache-model
+        uses: actions/cache@v4
+        with:
+          path: models
+          key: qwen2.5-7b-instruct-q4_k_m-v1
+
+      - name: Download model weights
+        if: steps.cache-model.outputs.cache-hit != 'true'
+        run: |
+          mkdir -p models
+          curl -sL "https://huggingface.co/Qwen/Qwen2.5-7B-Instruct-GGUF/resolve/main/qwen2.5-7b-instruct-q4_k_m-00001-of-00002.gguf" \
+            -o models/qwen2.5-7b-instruct-q4_k_m-00001-of-00002.gguf
+          curl -sL "https://huggingface.co/Qwen/Qwen2.5-7B-Instruct-GGUF/resolve/main/qwen2.5-7b-instruct-q4_k_m-00002-of-00002.gguf" \
+            -o models/qwen2.5-7b-instruct-q4_k_m-00002-of-00002.gguf
+
+      - name: Run the reporter
+        env:
+          LLAMA_CLI: ${{ github.workspace }}/llamacpp-bin/llama-${{ steps.llamacpp.outputs.tag }}/llama-cli
+          LOCAL_MODEL_PATH: ${{ github.workspace }}/models/qwen2.5-7b-instruct-q4_k_m-00001-of-00002.gguf
+          LOCAL_LLM_THREADS: '2'
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+        run: |
+          chmod +x "$LLAMA_CLI"
+          # The binary's own directory holds the .so files it needs; Linux doesn't
+          # search an executable's own directory for shared libs the way Windows does.
+          export LD_LIBRARY_PATH="$(dirname "$LLAMA_CLI"):$LD_LIBRARY_PATH"
+          python reporter/run_reporter_cloud.py
+
+      - name: Upload this week's output as a run artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: digest-${{ github.run_id }}
+          path: reporter-output/
+          retention-days: 90
+
+      - name: Commit updated state (seen.json)
+        run: |
+          git config user.name "reporter-bot"
+          git config user.email "actions@users.noreply.github.com"
+          git add reporter/seen.json
+          git diff --staged --quiet || git commit -m "Update seen.json [skip ci]"
+          git push

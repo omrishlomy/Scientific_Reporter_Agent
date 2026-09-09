@@ -1,0 +1,53 @@
+name: Telegram topic manager
+
+# Short-polls Telegram every 5 minutes for /addtopic, /removetopic, /topics commands.
+# This is the practical shape of "an interactive bot" on Actions: runners are
+# ephemeral, so there's no always-on connection -- commands land within ~5 minutes
+# instead of instantly. See reporter/bot_poll.py for the actual command handling and
+# why query-drafting-from-plain-English was deliberately left out of this fast path.
+#
+# Safe to run this often ONLY because this repo is public (unlimited free Actions
+# minutes) and contains no research data or personal file listings -- see the repo
+# README for why the filer agent and this reporter were deliberately split into
+# separate repos over exactly this concern.
+
+on:
+  schedule:
+    - cron: '*/5 * * * *'
+  workflow_dispatch: {}
+
+permissions:
+  contents: write   # commits topics.yaml changes and the update-id offset file
+
+concurrency:
+  group: telegram-bot
+  cancel-in-progress: false   # never skip a poll -- a skipped offset update could replay old messages
+
+jobs:
+  poll:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install Python dependencies
+        run: pip install pyyaml requests
+
+      - name: Poll for commands
+        id: poll
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+        run: python reporter/bot_poll.py
+
+      - name: Commit any topic changes
+        run: |
+          git config user.name "reporter-bot"
+          git config user.email "actions@users.noreply.github.com"
+          git add reporter/topics.yaml reporter/telegram-offset.json
+          git diff --staged --quiet || git commit -m "Update topics via Telegram [skip ci]"
+          git push

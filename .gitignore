@@ -1,0 +1,14 @@
+# Restored by GitHub Actions cache each run -- never commit multi-GB binaries/weights.
+llamacpp-bin/
+models/
+
+# Local test output -- the real output goes to Telegram + the run's artifact upload.
+reporter-output/
+
+__pycache__/
+*.pyc
+
+# Local-machine credential files, in case this is ever cloned back down for local
+# testing with setup-telegram.ps1-style scripts -- never belongs in git regardless.
+*.cred
+telegram-config.json
