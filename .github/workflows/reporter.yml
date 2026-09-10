@@ -19,7 +19,11 @@ concurrency:
 jobs:
   run:
     runs-on: ubuntu-latest
-    timeout-minutes: 90   # generous headroom for CPU-only inference on a free runner
+    # A real number this time, not a guess: fetch + two Groq API calls + rendering
+    # the infographic all complete in well under a minute of actual work. Generous
+    # multiple of that for headroom, not the 90 min the retired CPU-inference
+    # approach needed.
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@v4
 
@@ -30,61 +34,12 @@ jobs:
       - name: Install Python dependencies
         run: pip install -r requirements.txt
 
-      - name: Resolve latest llama.cpp CPU build
-        id: llamacpp
-        run: |
-          TAG=$(curl -sL https://github.com/ggml-org/llama.cpp/releases/latest/download/nightly-tag.txt)
-          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
-
-      - name: Cache llama.cpp binary
-        id: cache-llamacpp
-        uses: actions/cache@v4
-        with:
-          path: llamacpp-bin
-          key: llamacpp-${{ steps.llamacpp.outputs.tag }}-ubuntu-x64
-
-      - name: Download llama.cpp CPU build
-        if: steps.cache-llamacpp.outputs.cache-hit != 'true'
-        run: |
-          mkdir -p llamacpp-bin
-          curl -sL "https://github.com/ggml-org/llama.cpp/releases/download/${{ steps.llamacpp.outputs.tag }}/llama-${{ steps.llamacpp.outputs.tag }}-bin-ubuntu-x64.tar.gz" \
-            -o llamacpp.tar.gz
-          # The archive's own top-level dir is llama-<tag>/ -- confirmed against the
-          # real tarball; it is NOT a build/bin/ CMake-install layout.
-          tar -xzf llamacpp.tar.gz -C llamacpp-bin
-
-      # Model weights are cached across runs so a normal week doesn't re-download
-      # ~4.7GB from Hugging Face -- only the first run (or a cache eviction) pays that
-      # cost. Swap the URL/key here to change models later.
-      - name: Cache model weights
-        id: cache-model
-        uses: actions/cache@v4
-        with:
-          path: models
-          key: qwen2.5-7b-instruct-q4_k_m-v1
-
-      - name: Download model weights
-        if: steps.cache-model.outputs.cache-hit != 'true'
-        run: |
-          mkdir -p models
-          curl -sL "https://huggingface.co/Qwen/Qwen2.5-7B-Instruct-GGUF/resolve/main/qwen2.5-7b-instruct-q4_k_m-00001-of-00002.gguf" \
-            -o models/qwen2.5-7b-instruct-q4_k_m-00001-of-00002.gguf
-          curl -sL "https://huggingface.co/Qwen/Qwen2.5-7B-Instruct-GGUF/resolve/main/qwen2.5-7b-instruct-q4_k_m-00002-of-00002.gguf" \
-            -o models/qwen2.5-7b-instruct-q4_k_m-00002-of-00002.gguf
-
       - name: Run the reporter
         env:
-          LLAMA_CLI: ${{ github.workspace }}/llamacpp-bin/llama-${{ steps.llamacpp.outputs.tag }}/llama-cli
-          LOCAL_MODEL_PATH: ${{ github.workspace }}/models/qwen2.5-7b-instruct-q4_k_m-00001-of-00002.gguf
-          LOCAL_LLM_THREADS: '2'
+          GROQ_API_KEY: ${{ secrets.GROQ_API_KEY }}
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
-        run: |
-          chmod +x "$LLAMA_CLI"
-          # The binary's own directory holds the .so files it needs; Linux doesn't
-          # search an executable's own directory for shared libs the way Windows does.
-          export LD_LIBRARY_PATH="$(dirname "$LLAMA_CLI"):$LD_LIBRARY_PATH"
-          python reporter/run_reporter_cloud.py
+        run: python reporter/run_reporter_cloud.py
 
       - name: Upload this week's output as a run artifact
         if: always()

@@ -24,6 +24,46 @@ from datetime import date
 HERE = pathlib.Path(__file__).parent
 OUT_DIR = pathlib.Path("reporter-output")   # relative -- lives inside the checked-out repo
 
+# Passed to Groq as a strict response_format -- see local_llm.run_prompt's docstring
+# for why: this makes gpt-oss-120b's output structurally guaranteed to match (right
+# field names, right nesting), rather than hoping the prompt's instructions are
+# followed. Strict mode requires every field listed in "required" and
+# "additionalProperties": false at every object level -- both Claude and the earlier
+# local Qwen model drifted from the requested field names under prompt-only
+# instructions, so this is a real fix, not an extra layer of hope.
+INFOGRAPHIC_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "topics": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "properties": {
+                    "name": {"type": "string"},
+                    "count": {"type": "integer"},
+                    "gist": {"type": "string"},
+                    "papers": {
+                        "type": "array",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "title": {"type": "string"},
+                                "finding": {"type": "string"},
+                            },
+                            "required": ["title", "finding"],
+                            "additionalProperties": False,
+                        },
+                    },
+                },
+                "required": ["name", "count", "gist", "papers"],
+                "additionalProperties": False,
+            },
+        },
+    },
+    "required": ["topics"],
+    "additionalProperties": False,
+}
+
 
 def log(msg: str) -> None:
     print(f"[run_reporter_cloud] {msg}", file=sys.stderr)
@@ -68,12 +108,16 @@ def main() -> int:
 
     digest_text = pathlib.Path(digest_path).read_text(encoding="utf-8")
 
-    # --- 2. synthesis (open-weights model) --------------------------------------
-    from local_llm import run_prompt   # imported here so --help works without the model configured
+    # --- 2. synthesis (Groq-hosted open-weights model) --------------------------
+    from local_llm import run_prompt   # imported here so --help works without GROQ_API_KEY set
 
     synthesis_prompt = (HERE / "synthesis-prompt.md").read_text(encoding="utf-8")
     try:
-        brief_prose = run_prompt(synthesis_prompt, digest_text, n_predict=1600)
+        # Generous budget: unlike the retired CPU-inference path, more tokens here
+        # cost seconds on Groq's hardware, not extra tens of minutes -- the previous
+        # tight budgets were sized to limit wall-clock time on a bottleneck that no
+        # longer exists, and 1200 tokens was measured to truncate the JSON below.
+        brief_prose = run_prompt(synthesis_prompt, digest_text, max_tokens=2000)
         brief_prose = re.sub(r"^\s*#\s+[^\n]*\n+", "", brief_prose)   # drop a stray H1
     except Exception as e:
         log(f"synthesis failed: {e}; continuing without a brief")
@@ -86,10 +130,12 @@ def main() -> int:
     json_block = None
     for attempt in (1, 2):
         try:
-            json_raw = run_prompt(infographic_prompt, digest_text, n_predict=1200)
+            json_raw = run_prompt(infographic_prompt, digest_text, max_tokens=3000,
+                                   json_schema=INFOGRAPHIC_SCHEMA)
             json_raw = re.sub(r"^```(json)?\s*", "", json_raw.strip())
             json_raw = re.sub(r"```\s*$", "", json_raw)
-            json.loads(json_raw)   # validate before trusting it
+            json.loads(json_raw)   # validate before trusting it -- syntax only; strict
+                                    # mode already guarantees the schema itself
             json_block = json_raw
             break
         except Exception as e:

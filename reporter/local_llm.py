@@ -1,94 +1,87 @@
 """
-Runs a prompt through a self-hosted open-weights model via the llama.cpp CLI, as a
-drop-in replacement for the `claude -p` calls the reporter used to make. Built for a
-GitHub Actions free runner: 2 CPU cores, ~7GB RAM, no persistent process between runs
--- so this shells out to `llama-cli` once per call rather than running a server.
+Runs a prompt through a large open-weights model hosted by Groq's free-tier API, as
+the replacement for the `claude -p` calls the reporter used to make.
 
-Requires:
-  - a llama.cpp CLI build (LLAMA_CLI env var, or bin/llama-cli on PATH)
-  - a GGUF model file (LOCAL_MODEL_PATH env var)
+This replaces an earlier self-hosted approach (llama.cpp CPU inference on a free
+GitHub Actions runner). That was measured, not assumed, to be a dead end: a 7B model
+ran at 2.2-2.5 tokens/sec on 2 throttled CPU cores, took ~41 minutes for a single
+synthesis call, used ~8.3GB RAM against a free runner's ~7GB budget even after
+quantizing the KV cache, and the extraction call's JSON never finished within a sane
+token budget. A bigger (~30GB) model would need proportionally MORE compute per
+token, making CPU-only inference slower still, not faster -- more RAM alone does not
+fix a compute-bound bottleneck. Groq runs the model on its own fast hardware instead,
+which fixes the speed and memory problems at once, keeps the model genuinely
+open-weight and large (openai/gpt-oss-120b, 120B params -- bigger than the original
+~30GB target), and stays on Groq's free tier.
+
+Needs GROQ_API_KEY set (a GitHub Actions secret in production; a local env var for
+manual testing). Get a free key at https://console.groq.com/keys -- this is an account
+Claude cannot create on your behalf.
 
     from local_llm import run_prompt
-    text = run_prompt(system_prompt_text, user_content, n_predict=1400)
+    text = run_prompt(system_prompt_text, user_content, max_tokens=1400)
 """
 
 from __future__ import annotations
 
 import os
-import subprocess
-import sys
-import tempfile
 
-DEFAULT_CTX = 24000     # covers a typical weekly digest (~15-20K tokens) plus output
-DEFAULT_TEMP = "0.4"    # lower than llama.cpp's 0.8 default -- favors consistency for
-                         # both the prose synthesis and the strict-JSON extraction call
+import requests
 
-
-def _resolve_llama_cli() -> str:
-    path = os.environ.get("LLAMA_CLI")
-    if path:
-        return path
-    # Fall back to a PATH lookup so this also works when the binary was apt/brew
-    # installed rather than hand-placed by the workflow.
-    return "llama-cli"
+GROQ_URL = "https://api.groq.com/openai/v1/chat/completions"
+MODEL = "openai/gpt-oss-120b"
+DEFAULT_TEMPERATURE = 0.4   # favors consistency for both prose synthesis and strict-JSON extraction
 
 
-def _resolve_model() -> str:
-    path = os.environ.get("LOCAL_MODEL_PATH")
-    if not path:
-        raise RuntimeError("LOCAL_MODEL_PATH is not set -- point it at the GGUF model file")
-    return path
+def run_prompt(system_prompt: str, user_content: str, max_tokens: int,
+                temperature: float = DEFAULT_TEMPERATURE, json_schema: dict | None = None) -> str:
+    """Runs one single-turn chat completion. Returns the model's text response.
 
+    json_schema, when given, is passed as a strict `response_format` -- gpt-oss-120b
+    supports constrained decoding, which makes the response STRUCTURALLY guaranteed
+    to match the schema (right field names, right types, right nesting). This is a
+    real fix, not a mitigation, for the schema-drift problem hit repeatedly with
+    prompt-only instructions (both Claude and the retired local Qwen model
+    occasionally invented their own field names despite explicit instructions not
+    to). Pass a plain JSON Schema object (properties/required/additionalProperties);
+    this wraps it in the request shape Groq expects.
 
-def run_prompt(system_prompt: str, user_content: str, n_predict: int, ctx: int = DEFAULT_CTX) -> str:
-    """Runs one single-turn completion. Returns the model's raw text output.
+    Raises RuntimeError on any non-2xx response or missing API key, so a caller's
+    existing try/except + retry logic (see run_reporter_cloud.py) keeps working
+    unchanged from the llama.cpp-based version."""
+    api_key = os.environ.get("GROQ_API_KEY")
+    if not api_key:
+        raise RuntimeError("GROQ_API_KEY is not set -- create a free key at https://console.groq.com/keys")
 
-    Writes the (potentially large) user content to a temp file and passes it via -f
-    rather than -p, since a command-line argument has an OS-imposed length limit that
-    a 15-20K token digest would exceed."""
-    llama_cli = _resolve_llama_cli()
-    model = _resolve_model()
+    body = {
+        "model": MODEL,
+        "messages": [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": user_content},
+        ],
+        "max_completion_tokens": max_tokens,
+        "temperature": temperature,
+    }
+    if json_schema is not None:
+        body["response_format"] = {
+            "type": "json_schema",
+            "json_schema": {"name": "extraction", "strict": True, "schema": json_schema},
+        }
 
-    with tempfile.NamedTemporaryFile(mode="w", suffix=".sys.txt", delete=False, encoding="utf-8") as sf:
-        sf.write(system_prompt)
-        sys_path = sf.name
-    with tempfile.NamedTemporaryFile(mode="w", suffix=".user.txt", delete=False, encoding="utf-8") as uf:
-        uf.write(user_content)
-        user_path = uf.name
+    resp = requests.post(
+        GROQ_URL,
+        headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
+        json=body,
+        timeout=120,   # a real API call, not CPU inference -- should complete in seconds
+    )
 
-    threads = os.environ.get("LOCAL_LLM_THREADS", "2")   # match the target runner's 2 cores
+    if resp.status_code != 200:
+        raise RuntimeError(f"Groq API error {resp.status_code}: {resp.text[:1000]}")
 
-    cmd = [
-        llama_cli, "-m", model,
-        "-sysf", sys_path,
-        "-f", user_path,
-        "-st", "--no-display-prompt", "--simple-io",
-        "-n", str(n_predict), "-c", str(ctx),
-        "--temp", DEFAULT_TEMP,
-        "-t", threads, "-tb", threads,
-        "--no-warmup",
-        # Quantized KV cache: measured ~8.9GB resident with the f16 default at a
-        # 24K context on this model, which does not fit a free GitHub Actions
-        # runner's ~7GB. q8_0 roughly halves that with negligible quality loss.
-        # Requires flash attention, which q8_0/q4_0 KV cache depends on in llama.cpp.
-        "-fa", "on", "-ctk", "q8_0", "-ctv", "q8_0",
-    ]
-
-    try:
-        result = subprocess.run(
-            cmd, capture_output=True, text=True, encoding="utf-8", errors="replace",
-            timeout=int(os.environ.get("LOCAL_LLM_TIMEOUT", "2400")),   # 40 min ceiling
-        )
-    finally:
-        os.unlink(sys_path)
-        os.unlink(user_path)
-
-    if result.returncode != 0:
-        raise RuntimeError(f"llama-cli exited {result.returncode}: {result.stderr[-2000:]}")
-
-    return result.stdout.strip()
+    data = resp.json()
+    return data["choices"][0]["message"]["content"].strip()
 
 
 if __name__ == "__main__":
-    # Quick manual smoke test: python local_llm.py "system prompt" "user text"
-    print(run_prompt(sys.argv[1], sys.argv[2], n_predict=200))
+    import sys
+    print(run_prompt(sys.argv[1], sys.argv[2], max_tokens=200))
