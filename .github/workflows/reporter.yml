@@ -35,10 +35,12 @@ jobs:
         run: pip install -r requirements.txt
 
       - name: Run the reporter
+        # MULTI-TENANT: no TELEGRAM_CHAT_ID here -- run_reporter_cloud.py loops over
+        # every chat registered under reporter/chats/ (populated by telegram-bot.yml
+        # when someone messages the bot) and sends each its own digest.
         env:
           GROQ_API_KEY: ${{ secrets.GROQ_API_KEY }}
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
-          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
         run: python reporter/run_reporter_cloud.py
 
       - name: Upload this week's output as a run artifact
@@ -49,10 +51,14 @@ jobs:
           path: reporter-output/
           retention-days: 90
 
-      - name: Commit updated state (seen.json)
+      - name: Commit updated state (each chat's seen.json)
         run: |
           git config user.name "reporter-bot"
           git config user.email "actions@users.noreply.github.com"
-          git add reporter/seen.json
-          git diff --staged --quiet || git commit -m "Update seen.json [skip ci]"
+          git add reporter/chats/
+          git diff --staged --quiet && exit 0
+          git commit -m "Update seen.json [skip ci]"
+          # The 5-minute bot poller commits to this same directory tree; rebase onto
+          # whatever it pushed in the meantime rather than failing outright.
+          git pull --rebase origin main
           git push

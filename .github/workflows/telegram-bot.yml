@@ -1,10 +1,13 @@
 name: Telegram topic manager
 
-# Short-polls Telegram every 5 minutes for /addtopic, /removetopic, /topics commands.
-# This is the practical shape of "an interactive bot" on Actions: runners are
-# ephemeral, so there's no always-on connection -- commands land within ~5 minutes
-# instead of instantly. See reporter/bot_poll.py for the actual command handling and
-# why query-drafting-from-plain-English was deliberately left out of this fast path.
+# Short-polls Telegram every 5 minutes for commands, per registered chat (see
+# reporter/chats_store.py). This is the practical shape of "an interactive bot" on
+# Actions: runners are ephemeral, so there's no always-on connection -- commands land
+# within ~5 minutes instead of instantly. Any chat that messages the bot is
+# auto-registered; see reporter/bot_poll.py for command handling, including
+# plain-English topic descriptions (drafted into a search query via Groq -- cheap and
+# fast now that synthesis also runs on Groq, unlike the original self-hosted model this
+# poller was designed around).
 #
 # Safe to run this often ONLY because this repo is public (unlimited free Actions
 # minutes) and contains no research data or personal file listings -- see the repo
@@ -17,7 +20,7 @@ on:
   workflow_dispatch: {}
 
 permissions:
-  contents: write   # commits topics.yaml changes and the update-id offset file
+  contents: write   # commits new/updated chats/ files and the update-id offset file
 
 concurrency:
   group: telegram-bot
@@ -38,16 +41,19 @@ jobs:
         run: pip install pyyaml requests
 
       - name: Poll for commands
-        id: poll
         env:
+          GROQ_API_KEY: ${{ secrets.GROQ_API_KEY }}
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
-          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
         run: python reporter/bot_poll.py
 
-      - name: Commit any topic changes
+      - name: Commit any chat/topic changes
         run: |
           git config user.name "reporter-bot"
           git config user.email "actions@users.noreply.github.com"
-          git add reporter/topics.yaml reporter/telegram-offset.json
-          git diff --staged --quiet || git commit -m "Update topics via Telegram [skip ci]"
+          git add reporter/chats/ reporter/telegram-offset.json
+          git diff --staged --quiet && exit 0
+          git commit -m "Update topics via Telegram [skip ci]"
+          # The weekly reporter workflow commits to the same directory tree; rebase
+          # onto whatever it pushed in the meantime rather than failing outright.
+          git pull --rebase origin main
           git push

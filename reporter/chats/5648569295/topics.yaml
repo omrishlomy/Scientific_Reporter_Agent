@@ -1,9 +1,5 @@
-# NOTE: this file is no longer what the live bot reads. In multi-tenant mode, each
-# Telegram chat gets its own reporter/chats/<chat_id>/topics.yaml (managed via bot
-# commands -- see bot_poll.py), created automatically the first time that chat
-# messages the bot. This file only matters for manual/local testing:
-#   python fetch_papers.py --dry-run --days 30
-# (fetch_papers.py's --topics-file defaults here if you don't pass one explicitly.)
+# This chat's topics -- managed via Telegram (/addtopic, /removetopic, /topics, or
+# just describe a topic in plain English), or edit by hand here, same effect either way.
 #
 # TO ADD A TOPIC:    copy a block, change name + query.
 # TO REMOVE:         delete the block, or just set  enabled: false

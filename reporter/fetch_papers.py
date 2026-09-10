@@ -37,8 +37,8 @@ for _stream in (sys.stdout, sys.stderr):
         _stream.reconfigure(encoding="utf-8", errors="replace")
 
 HERE = pathlib.Path(__file__).parent
-TOPICS_FILE = HERE / "topics.yaml"
-SEEN_FILE = HERE / "seen.json"
+DEFAULT_TOPICS_FILE = HERE / "topics.yaml"
+DEFAULT_SEEN_FILE = HERE / "seen.json"
 DEFAULT_OUT = pathlib.Path(r"G:\My Drive\Research\Digests")
 
 API = "https://www.ebi.ac.uk/europepmc/webservices/rest/search"
@@ -47,20 +47,20 @@ UA = "ArziLab-paper-digest/1.0 (mailto:omrishlomy44@gmail.com)"
 TIMEOUT = 30
 
 
-def load_seen() -> set[str]:
-    if SEEN_FILE.exists():
+def load_seen(seen_file: pathlib.Path) -> set[str]:
+    if seen_file.exists():
         try:
-            return set(json.loads(SEEN_FILE.read_text(encoding="utf-8")))
+            return set(json.loads(seen_file.read_text(encoding="utf-8")))
         except json.JSONDecodeError:
             # A corrupt seen-list must not stop the digest; worst case we repeat a week.
-            print("WARN seen.json unreadable, starting fresh", file=sys.stderr)
+            print(f"WARN {seen_file} unreadable, starting fresh", file=sys.stderr)
     return set()
 
 
-def save_seen(seen: set[str]) -> None:
+def save_seen(seen: set[str], seen_file: pathlib.Path) -> None:
     # Keep it bounded: 5000 ids is years of history at this volume.
     trimmed = sorted(seen)[-5000:]
-    SEEN_FILE.write_text(json.dumps(trimmed, indent=0), encoding="utf-8")
+    seen_file.write_text(json.dumps(trimmed, indent=0), encoding="utf-8")
 
 
 def search(query: str, since: dt.date, limit: int, preprints: bool) -> list[dict]:
@@ -189,16 +189,20 @@ def main() -> int:
     ap.add_argument("--dry-run", action="store_true", help="print instead of writing")
     ap.add_argument("--days", type=int, help="override lookback_days")
     ap.add_argument("--out", type=pathlib.Path, default=DEFAULT_OUT)
+    ap.add_argument("--topics-file", type=pathlib.Path, default=DEFAULT_TOPICS_FILE,
+                     help="per-chat topics.yaml in multi-tenant mode; defaults to the shared one")
+    ap.add_argument("--seen-file", type=pathlib.Path, default=DEFAULT_SEEN_FILE,
+                     help="per-chat seen.json in multi-tenant mode; defaults to the shared one")
     args = ap.parse_args()
 
-    cfg = yaml.safe_load(TOPICS_FILE.read_text(encoding="utf-8"))
+    cfg = yaml.safe_load(args.topics_file.read_text(encoding="utf-8")) or {}
     settings = cfg.get("settings", {}) or {}
     days = args.days or int(settings.get("lookback_days", 7))
     cap = int(settings.get("max_per_topic", 8))
     preprints = bool(settings.get("preprints", True))
     since = dt.date.today() - dt.timedelta(days=days)
 
-    seen = load_seen()
+    seen = load_seen(args.seen_file)
     fresh: set[str] = set()
 
     today = dt.date.today()
@@ -262,9 +266,9 @@ def main() -> int:
     srcfile = unique_path(args.out, f"sources-{today.isoformat()}", ".md")
     srcfile.write_text(build_sources(sources, today), encoding="utf-8")
 
-    save_seen(seen | fresh)
+    save_seen(seen | fresh, args.seen_file)
 
-    # stdout is consumed by run-reporter.ps1.
+    # stdout is consumed by the caller (run_reporter_cloud.py / run-reporter.ps1).
     print(f"{total}|{outfile}|{srcfile}")
     return 0
 

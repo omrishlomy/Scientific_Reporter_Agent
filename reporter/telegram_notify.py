@@ -5,9 +5,13 @@ credential storage (DPAPI) is Windows-only anyway. Reads the bot token from an
 environment variable (a GitHub Actions secret), not a local encrypted file, since
 there is no persistent "this machine" to scope DPAPI to on an ephemeral runner.
 
-    python telegram_notify.py --message "text" [--photo path.png] [--document path.md]
+    python telegram_notify.py --chat-id 123456 --message "text" [--photo path.png] [--document path.md]
 
-Exits 0 on success, 1 on failure, 2 if TELEGRAM_BOT_TOKEN / TELEGRAM_CHAT_ID are unset
+--chat-id is required in multi-tenant mode (one send per registered chat). Falls back
+to the TELEGRAM_CHAT_ID env var if --chat-id is omitted, for any single-chat/local
+testing use.
+
+Exits 0 on success, 1 on failure, 2 if TELEGRAM_BOT_TOKEN or a chat id are unset
 (so a missing secret degrades the run to "no notification" rather than failing it).
 """
 from __future__ import annotations
@@ -24,12 +28,13 @@ def main() -> int:
     ap.add_argument("--message", required=True)
     ap.add_argument("--photo")
     ap.add_argument("--document")
+    ap.add_argument("--chat-id", help="defaults to TELEGRAM_CHAT_ID env var if omitted")
     args = ap.parse_args()
 
     token = os.environ.get("TELEGRAM_BOT_TOKEN")
-    chat_id = os.environ.get("TELEGRAM_CHAT_ID")
+    chat_id = args.chat_id or os.environ.get("TELEGRAM_CHAT_ID")
     if not token or not chat_id:
-        print("WARN TELEGRAM_BOT_TOKEN/TELEGRAM_CHAT_ID not set; skipping", file=sys.stderr)
+        print("WARN TELEGRAM_BOT_TOKEN / chat id not set; skipping", file=sys.stderr)
         return 2
 
     base = f"https://api.telegram.org/bot{token}"

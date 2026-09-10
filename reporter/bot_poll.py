@@ -1,27 +1,28 @@
 """
 Interactive topic management, run every ~5 minutes by
 .github/workflows/telegram-bot.yml. Short-polls Telegram for new messages and applies
-simple structured commands to topics.yaml -- this is the practical answer to "let the
-bot manage topics" on a GitHub Actions runner, which is ephemeral and can't hold an
-always-on long-poll connection the way a real server could.
+commands per-chat -- the practical shape of "an interactive bot" on Actions, which is
+ephemeral and can't hold an always-on long-poll connection the way a real server could.
 
-Deliberately does NOT use the local LLM here: this job is meant to run every 5 minutes
-and reply within seconds, and loading a multi-GB model just to check "is there a new
-message" would make it slow and expensive for no benefit. Query drafting from a plain
-description (rather than typing raw Europe PMC syntax) is a reasonable future addition,
-but it belongs in a heavier, less-frequent job -- shipping the simple, reliable version
-first rather than bundling it in here.
+MULTI-TENANT: any chat that messages the bot is auto-registered (see chats_store.py)
+with its own topics.yaml and seen.json, and gets its own weekly digest. There is no
+allowlist -- the bot's username is not a secret once shared, so anyone who has it can
+register a chat and use it. That's an accepted, low-stakes tradeoff here (Groq's free
+tier and Europe PMC cost nothing per use); add a `chats_store.py` allowlist check if
+that ever needs to change.
 
-SECURITY: only ever acts on messages from TELEGRAM_CHAT_ID (the owner's own chat).
-Anyone who discovers the bot's public username can message it, and a bot token is not
-a secret in the way an API key is -- so a message from any other chat is logged and
-ignored, never actioned, regardless of what it says.
-
-Commands:
-  /topics                      list current topics
-  /addtopic <name> | <query>   add a topic (Europe PMC query syntax -- see topics.yaml)
-  /removetopic <name>          disable a topic (kept in the file, enabled: false)
+Commands (per chat):
+  /topics                      list this chat's topics
+  /addtopic <name> | <query>   add a topic with an exact Europe PMC query
+  /removetopic <name>          disable a topic
   /help                        usage
+  <anything else>              treated as a plain-language topic description -- drafted
+                                into a query via Groq (see topic-draft-prompt.md) and
+                                added directly. This is now cheap and fast because Groq
+                                hosts the model; the original reporter design avoided
+                                any LLM call in this fast poller specifically because
+                                the model was a slow self-hosted one -- that constraint
+                                no longer applies now that synthesis runs on Groq too.
 """
 from __future__ import annotations
 
@@ -34,17 +35,40 @@ import sys
 import requests
 import yaml
 
+import chats_store
+
 HERE = pathlib.Path(__file__).parent
-TOPICS_FILE = HERE / "topics.yaml"
 OFFSET_FILE = HERE / "telegram-offset.json"
+TOPIC_DRAFT_PROMPT_FILE = HERE / "topic-draft-prompt.md"
+
+TOPIC_DRAFT_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "name": {"type": "string"},
+        "query": {"type": "string"},
+    },
+    "required": ["name", "query"],
+    "additionalProperties": False,
+}
 
 HELP_TEXT = (
     "Commands:\n"
-    "/topics - list current topics\n"
-    "/addtopic <name> | <query> - add a topic\n"
+    "/topics - list your topics\n"
+    "/addtopic <name> | <query> - add a topic with an exact Europe PMC query\n"
     "  example: /addtopic Vagus nerve | (TITLE:\"vagus nerve\" OR TITLE:VNS) AND (TITLE:brain OR TITLE:stimulation)\n"
     "/removetopic <name> - disable a topic\n"
-    "/help - this message"
+    "/help - this message\n\n"
+    "Or just tell me what you're interested in, in plain English, and I'll set up the "
+    "search for you (e.g. \"psychedelics and consciousness\")."
+)
+
+WELCOME_TEXT = (
+    "Welcome! I'll send you a weekly digest of new research papers, based on topics "
+    "you choose.\n\n"
+    "Tell me what you're interested in -- plain English is fine (e.g. \"neural "
+    "interfaces for paralysis\" or \"sleep and memory consolidation\") and I'll set up "
+    "the search. Add as many as you like, any time.\n\n"
+    "Send /help for other commands."
 )
 
 
@@ -63,62 +87,76 @@ def send(token: str, chat_id: str, text: str) -> None:
                   data={"chat_id": chat_id, "text": text[:4090]}, timeout=30)
 
 
-def handle_topics(reply) -> None:
-    cfg = yaml.safe_load(TOPICS_FILE.read_text(encoding="utf-8")) or {}
+def handle_topics(chat_id: str, reply) -> None:
+    cfg = yaml.safe_load(chats_store.topics_path(chat_id).read_text(encoding="utf-8")) or {}
     topics = cfg.get("topics", [])
     if not topics:
-        reply("No topics configured.")
+        reply("No topics yet -- just tell me what you're interested in, in plain English.")
         return
-    lines = []
-    for t in topics:
-        status = "on" if t.get("enabled", True) else "off (disabled)"
-        lines.append(f"- {t.get('name', 'Unnamed')} [{status}]")
-    reply("Current topics:\n" + "\n".join(lines))
+    lines = [f"- {t.get('name', 'Unnamed')} [{'on' if t.get('enabled', True) else 'off (disabled)'}]"
+             for t in topics]
+    reply("Your topics:\n" + "\n".join(lines))
 
 
-def handle_addtopic(arg: str, reply) -> None:
+def add_topic(chat_id: str, name: str, query: str) -> tuple[bool, str]:
+    """Returns (added, message)."""
+    path = chats_store.topics_path(chat_id)
+    cfg = yaml.safe_load(path.read_text(encoding="utf-8")) or {"settings": {}, "topics": []}
+    if any(t.get("name", "").lower() == name.lower() for t in cfg.get("topics", [])):
+        return False, f"A topic named '{name}' already exists. Use /removetopic first to replace it."
+    cfg.setdefault("topics", []).append({"name": name, "enabled": True, "query": query})
+    path.write_text(yaml.dump(cfg, sort_keys=False, allow_unicode=True, width=100), encoding="utf-8")
+    return True, f"Added topic '{name}':\n{query}\n\nIf that's not quite right, /removetopic {name} and try again with different wording."
+
+
+def handle_addtopic(chat_id: str, arg: str, reply) -> None:
     if "|" not in arg:
         reply("Format: /addtopic <name> | <query>\n\n"
-              "Example: /addtopic Vagus nerve | (TITLE:\"vagus nerve\" OR TITLE:VNS) AND (TITLE:brain OR TITLE:stimulation)\n\n"
-              "The query uses Europe PMC syntax -- see the comments at the top of topics.yaml.")
+              "Or just describe the topic in plain English without the /addtopic command "
+              "and I'll draft the query for you.")
         return
     name, query = (p.strip() for p in arg.split("|", 1))
     if not name or not query:
         reply("Both a name and a query are needed -- see /help.")
         return
-
-    cfg = yaml.safe_load(TOPICS_FILE.read_text(encoding="utf-8")) or {"settings": {}, "topics": []}
-    existing = [t for t in cfg.get("topics", []) if t.get("name", "").lower() == name.lower()]
-    if existing:
-        reply(f"A topic named '{name}' already exists. Use /removetopic first if you want to replace it.")
-        return
-
-    cfg.setdefault("topics", []).append({"name": name, "enabled": True, "query": query})
-    TOPICS_FILE.write_text(yaml.dump(cfg, sort_keys=False, allow_unicode=True, width=100), encoding="utf-8")
-    reply(f"Added topic '{name}'. It'll show up in next week's digest.")
+    _, msg = add_topic(chat_id, name, query)
+    reply(msg)
 
 
-def handle_removetopic(arg: str, reply) -> None:
+def handle_removetopic(chat_id: str, arg: str, reply) -> None:
     name = arg.strip()
     if not name:
         reply("Format: /removetopic <name>")
         return
-    cfg = yaml.safe_load(TOPICS_FILE.read_text(encoding="utf-8")) or {}
-    topics = cfg.get("topics", [])
-    match = next((t for t in topics if t.get("name", "").lower() == name.lower()), None)
+    path = chats_store.topics_path(chat_id)
+    cfg = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
+    match = next((t for t in cfg.get("topics", []) if t.get("name", "").lower() == name.lower()), None)
     if not match:
         reply(f"No topic named '{name}' found. Send /topics to see current names.")
         return
     match["enabled"] = False
-    TOPICS_FILE.write_text(yaml.dump(cfg, sort_keys=False, allow_unicode=True, width=100), encoding="utf-8")
-    reply(f"Disabled topic '{name}'. (Left in the file, in case you want it back -- edit topics.yaml to remove it entirely.)")
+    path.write_text(yaml.dump(cfg, sort_keys=False, allow_unicode=True, width=100), encoding="utf-8")
+    reply(f"Disabled topic '{name}'.")
+
+
+def handle_natural_language(chat_id: str, text: str, reply) -> None:
+    from local_llm import run_prompt   # imported lazily -- most polls never reach here
+    try:
+        prompt = TOPIC_DRAFT_PROMPT_FILE.read_text(encoding="utf-8")
+        raw = run_prompt(prompt, text, max_tokens=300, json_schema=TOPIC_DRAFT_SCHEMA)
+        draft = json.loads(raw)
+        _, msg = add_topic(chat_id, draft["name"], draft["query"])
+        reply(msg)
+    except Exception as e:
+        print(f"WARN topic drafting failed: {e}", file=sys.stderr)
+        reply("Couldn't turn that into a search automatically -- try /addtopic <name> | <query> "
+              "with an exact query instead (see /help), or rephrase.")
 
 
 def main() -> int:
     token = os.environ.get("TELEGRAM_BOT_TOKEN")
-    owner_chat_id = os.environ.get("TELEGRAM_CHAT_ID")
-    if not token or not owner_chat_id:
-        print("TELEGRAM_BOT_TOKEN/TELEGRAM_CHAT_ID not set", file=sys.stderr)
+    if not token:
+        print("TELEGRAM_BOT_TOKEN not set", file=sys.stderr)
         return 1
 
     offset = load_offset()
@@ -127,7 +165,6 @@ def main() -> int:
     resp.raise_for_status()
     updates = resp.json().get("result", [])
 
-    changed = False
     max_update_id = offset
 
     for upd in updates:
@@ -137,33 +174,32 @@ def main() -> int:
             continue
 
         chat_id = str(msg["chat"]["id"])
-        if chat_id != str(owner_chat_id):
-            # Never act on a message from anyone but the configured owner chat --
-            # the bot's username is not secret, so this is a real access boundary.
-            print(f"IGNORED message from unauthorized chat {chat_id}", file=sys.stderr)
-            continue
-
+        chat_name = msg["chat"].get("title") or msg["chat"].get("username") or msg["chat"].get("first_name", "")
         text = msg["text"].strip()
-        reply = lambda t: send(token, owner_chat_id, t)
+        reply = lambda t: send(token, chat_id, t)
+
+        is_new = chats_store.register_chat(chat_id, chat_name)
+        if is_new:
+            reply(WELCOME_TEXT)
+            if text in ("/start", "/help"):
+                continue   # don't also treat "/start" itself as a topic description
 
         if text in ("/help", "/start"):
             reply(HELP_TEXT)
         elif text == "/topics":
-            handle_topics(reply)
+            handle_topics(chat_id, reply)
         elif text.startswith("/addtopic"):
-            handle_addtopic(text[len("/addtopic"):].strip(), reply)
-            changed = True
+            handle_addtopic(chat_id, text[len("/addtopic"):].strip(), reply)
         elif text.startswith("/removetopic"):
-            handle_removetopic(text[len("/removetopic"):].strip(), reply)
-            changed = True
-        else:
+            handle_removetopic(chat_id, text[len("/removetopic"):].strip(), reply)
+        elif text.startswith("/"):
             reply("Unknown command. Send /help for the list.")
+        else:
+            handle_natural_language(chat_id, text, reply)
 
     if max_update_id > offset:
         save_offset(max_update_id)
 
-    # Signal to the workflow YAML whether topics.yaml needs to be committed.
-    print("CHANGED=1" if changed else "CHANGED=0")
     return 0
 
 
