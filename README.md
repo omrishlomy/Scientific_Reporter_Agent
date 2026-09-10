@@ -49,36 +49,54 @@ Two reasons, both load-bearing:
 Nothing sensitive lives here: topic keywords, paper DOIs already reported (`seen.json`),
 and the pipeline code itself.
 
+## Multi-tenant: works in any number of Telegram chats
+
+There's no fixed "chat ID" to configure -- **any chat that messages the bot
+auto-registers itself** with its own topics and its own weekly digest. This is why the
+old `TELEGRAM_CHAT_ID` secret is gone; it doesn't mean anything once more than one chat
+is in play.
+
+- First message from a new chat gets a welcome + is asked what it's interested in.
+- Reply in plain English (e.g. "psychedelics and consciousness") and the bot drafts a
+  Europe PMC search query for it via Groq and adds it as a topic -- see
+  `reporter/topic-draft-prompt.md`. Or use `/addtopic <name> | <exact query>` if you
+  want to write the query yourself.
+- `/topics` lists that chat's topics, `/removetopic <name>` disables one.
+- Each chat's state lives at `reporter/chats/<chat_id>/` (`topics.yaml`, `seen.json`,
+  `meta.json`) -- dedup is per-chat on purpose: two chats interested in the same thing
+  each still need to see a paper neither has been sent yet.
+- **No allowlist.** The bot's username isn't a secret once you've shared it, so anyone
+  who has it can register a chat and start using it -- accepted as low-stakes here
+  since Groq's free tier and Europe PMC cost nothing per use. Add a check in
+  `chats_store.py` if that ever needs to change.
+
+Your existing single-chat setup (topics + already-seen papers) was migrated
+automatically into `reporter/chats/5648569295/` -- nothing was lost or needs re-adding.
+
 ## Two workflows
 
-- **`reporter.yml`** -- Mondays 08:00 Israel time. Fetches new papers (Europe PMC),
-  writes a synthesis brief and infographic via Groq, sends both to Telegram, commits
-  the updated `seen.json` dedup list back to the repo. Real expected runtime: well
-  under a minute of actual work (a few Groq API calls plus rendering an image) --
-  timeout is set to 15 minutes purely for headroom.
-- **`telegram-bot.yml`** -- every 5 minutes. Checks for `/addtopic`, `/removetopic`,
-  `/topics` commands and commits changes to `topics.yaml`. Deliberately simple/rule-based,
-  not LLM-backed -- see the comment at the top of `reporter/bot_poll.py` for why.
+- **`reporter.yml`** -- Mondays 08:00 Israel time. Loops over every registered chat:
+  fetches that chat's new papers (Europe PMC), writes a synthesis brief and infographic
+  via Groq, sends both to that chat's Telegram, commits the updated `seen.json` files
+  back to the repo. Real expected runtime: well under a minute of actual work per chat
+  -- timeout is set to 15 minutes purely for headroom.
+- **`telegram-bot.yml`** -- every 5 minutes. Registers new chats, handles
+  `/addtopic`, `/removetopic`, `/topics`, and plain-English topic descriptions (see
+  above), commits any changes under `reporter/chats/`.
 
 ## Setup status
 
 - [x] Repo created (public, github.com/omrishlomy) and pushed.
-- [ ] **Get a free Groq API key** at https://console.groq.com/keys (an account Claude
-  cannot create on your behalf).
-- [ ] **Add three repo secrets** -- repo -> Settings -> Secrets and variables -> Actions
-  -> New repository secret. This step needs you: entering tokens/credentials isn't
-  something Claude does on your behalf, even into a form field.
-  - `GROQ_API_KEY` -- from the step above
-  - `TELEGRAM_BOT_TOKEN` -- the same token from `@BotFather` used for the local PC setup
-  - `TELEGRAM_CHAT_ID` -- your chat id (the one `setup-telegram.ps1` auto-detected on
-    the PC; check `telegram-config.json` there if you need to look it up again)
+- [x] Groq API key and Telegram bot token added as repo secrets.
 - [ ] Confirm Actions is enabled on the repo (Actions tab -- first-time repos sometimes
   need this confirmed explicitly).
 - [ ] Trigger the reporter once manually to confirm it works end to end: Actions tab ->
   "Weekly paper digest" -> Run workflow. Should finish in well under a minute of actual
-  compute (plus a few seconds of GitHub's own job startup overhead) -- if it's still
-  running after several minutes, something is actually wrong (check the job log for a
-  Groq API error, most likely a missing/invalid `GROQ_API_KEY`).
+  compute per chat (plus a few seconds of GitHub's own job startup overhead) -- if it's
+  still running after several minutes, something is actually wrong (check the job log
+  for a Groq API error, most likely a missing/invalid `GROQ_API_KEY`).
+- [ ] Try adding a second chat: message the bot from another Telegram account (or a
+  group it's added to) and confirm it registers and takes a topic.
 
 Once confirmed working, you can retire the Windows Scheduled Task
 (`ClaudeAgent-Reporter`) on the PC -- this repo replaces it. The download-filer agent
@@ -87,11 +105,18 @@ migration.
 
 ## Known constraints (read before assuming something's broken)
 
-- **Groq free tier has rate limits.** Fine at this volume (a handful of calls, once a
-  week, plus occasional topic-management commands) -- see
-  https://console.groq.com/docs/rate-limits if this ever needs to scale up.
+- **Groq free tier has rate limits**, shared across all chats using this bot. Fine at
+  small scale -- see https://console.groq.com/docs/rate-limits if this grows a lot.
 - **Topic commands land within ~5 minutes, not instantly** -- a consequence of Actions
   runners being ephemeral rather than a persistent bot process.
+- **Plain-English topic drafting can misfire** -- it's one Groq call with no human
+  review before the topic is saved. If a drafted query looks wrong, `/removetopic
+  <name>` and try again with different wording, or use `/addtopic <name> | <query>`
+  to write the exact query yourself.
 - **Quality vs. Claude:** not independently re-measured against gpt-oss-120b yet (the
   quality comparison on record was against the retired local Qwen2.5-7B run, which was
   worse). Worth a real side-by-side after a few real Monday runs land.
+- **Concurrent-commit risk:** the weekly reporter and the 5-minute poller both commit
+  to `reporter/chats/`. Both now do `git pull --rebase` before pushing, which handles
+  the common case, but a very unlucky simultaneous push could still need a manual
+  `git pull --rebase` if a workflow run ever fails on a push step.
