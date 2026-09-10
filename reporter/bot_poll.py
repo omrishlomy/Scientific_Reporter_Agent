@@ -160,9 +160,22 @@ def main() -> int:
         return 1
 
     offset = load_offset()
-    resp = requests.get(f"https://api.telegram.org/bot{token}/getUpdates",
-                         params={"offset": offset + 1, "timeout": 0}, timeout=30)
-    resp.raise_for_status()
+    try:
+        resp = requests.get(f"https://api.telegram.org/bot{token}/getUpdates",
+                             params={"offset": offset + 1, "timeout": 0}, timeout=30)
+        resp.raise_for_status()
+    except requests.exceptions.HTTPError as e:
+        if resp.status_code in (401, 404):
+            print(f"ERROR Telegram rejected the bot token (HTTP {resp.status_code}) -- "
+                  f"check the TELEGRAM_BOT_TOKEN repo secret for a typo or stray whitespace. "
+                  f"Response: {resp.text[:300]}", file=sys.stderr)
+        else:
+            print(f"ERROR getUpdates failed: {e}. Response: {resp.text[:300]}", file=sys.stderr)
+        return 1
+    except requests.exceptions.RequestException as e:
+        print(f"ERROR getUpdates request failed: {e}", file=sys.stderr)
+        return 1
+
     updates = resp.json().get("result", [])
 
     max_update_id = offset
