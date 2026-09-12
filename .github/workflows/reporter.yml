@@ -55,7 +55,9 @@ jobs:
         run: |
           git config user.name "reporter-bot"
           git config user.email "actions@users.noreply.github.com"
-          git add reporter/chats/
+          # -A over the directory rather than explicit paths -- see telegram-bot.yml for
+          # why (a missing pathspec makes `git add` fail the whole step).
+          git add -A reporter/
           git diff --staged --quiet && exit 0
           git commit -m "Update seen.json [skip ci]"
           # The 5-minute bot poller commits to this same directory tree; rebase onto

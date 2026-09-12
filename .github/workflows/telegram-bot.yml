@@ -50,7 +50,11 @@ jobs:
         run: |
           git config user.name "reporter-bot"
           git config user.email "actions@users.noreply.github.com"
-          git add reporter/chats/ reporter/telegram-offset.json
+          # -A over an existing directory, NOT explicit file paths: telegram-offset.json
+          # only gets created once a run actually processes a message, and `git add` on
+          # a path that doesn't exist is a fatal error (exit 128) that killed this step
+          # on every run until it was caught.
+          git add -A reporter/
           git diff --staged --quiet && exit 0
           git commit -m "Update topics via Telegram [skip ci]"
           # The weekly reporter workflow commits to the same directory tree; rebase
