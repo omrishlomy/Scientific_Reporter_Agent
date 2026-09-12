@@ -41,18 +41,29 @@ import run_reporter_cloud  # noqa: E402
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger("reporter")
 
-TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")
+def _env(name: str) -> str:
+    """Reads a variable with surrounding whitespace and matching quotes removed.
+    Dashboard editors (Railway's raw editor included) happily store `"value"` with the
+    quote characters as part of the value, or a trailing space/newline from a paste. For
+    the webhook secret that makes Telegram reject registration outright -- a real deploy
+    failed the character check with a secret that was letters and digits only."""
+    v = os.environ.get(name, "").strip()
+    if len(v) >= 2 and v[0] == v[-1] and v[0] in "\"'":
+        v = v[1:-1].strip()
+    return v
+
+
+TOKEN = _env("TELEGRAM_BOT_TOKEN")
 # Telegram echoes this back in X-Telegram-Bot-Api-Secret-Token on every webhook call.
 # Without checking it, the endpoint is a public URL that anyone could POST fake updates
 # to -- which here would mean adding topics or triggering report generation at will.
-WEBHOOK_SECRET = os.environ.get("TELEGRAM_WEBHOOK_SECRET", "")
+WEBHOOK_SECRET = _env("TELEGRAM_WEBHOOK_SECRET")
 # e.g. https://<service>.up.railway.app. Falls back to RAILWAY_PUBLIC_DOMAIN, which
 # Railway injects automatically once the service has a generated domain -- the first
 # real deploy failed with "PUBLIC_URL missing" and the bot silently received nothing, so
 # don't depend on a variable that has to be hand-copied from the same dashboard.
-PUBLIC_URL = os.environ.get("PUBLIC_URL", "").strip() or (
-    f"https://{os.environ['RAILWAY_PUBLIC_DOMAIN'].strip()}"
-    if os.environ.get("RAILWAY_PUBLIC_DOMAIN", "").strip() else "")
+PUBLIC_URL = _env("PUBLIC_URL") or (
+    f"https://{_env('RAILWAY_PUBLIC_DOMAIN')}" if _env("RAILWAY_PUBLIC_DOMAIN") else "")
 TIMEZONE = os.environ.get("TIMEZONE", "Asia/Jerusalem")
 
 app = FastAPI(title="Scientific Reporter")
@@ -104,8 +115,11 @@ def register_webhook() -> None:
     if WEBHOOK_SECRET and not re.fullmatch(r"[A-Za-z0-9_-]{1,256}", WEBHOOK_SECRET):
         # Telegram rejects the whole setWebhook call if the secret has any other
         # character, and the bot then silently receives nothing.
-        log.error("TELEGRAM_WEBHOOK_SECRET may only contain A-Z a-z 0-9 _ - "
-                  "(1-256 chars); webhook NOT registered -- change the variable")
+        # Name the offending characters, never the secret itself.
+        bad = sorted({c for c in WEBHOOK_SECRET if not re.fullmatch(r"[A-Za-z0-9_-]", c)})
+        log.error("TELEGRAM_WEBHOOK_SECRET may only contain A-Z a-z 0-9 _ - (1-256 chars); "
+                  "found disallowed %s, length %d; webhook NOT registered",
+                  [repr(c) for c in bad], len(WEBHOOK_SECRET))
         return
 
     url = f"{PUBLIC_URL.rstrip('/')}/telegram/webhook"
