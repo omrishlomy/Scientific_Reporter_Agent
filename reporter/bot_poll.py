@@ -11,7 +11,7 @@ register a chat and use it. That's an accepted, low-stakes tradeoff here (Groq's
 tier and Europe PMC cost nothing per use); add a `chats_store.py` allowlist check if
 that ever needs to change.
 
-Primary interface is *ASTERISK* topics -- send `*psychedelics* *neurofeedback*` and each
+Primary interface is *ASTERISK* topics -- send `*sleep and memory* *gut microbiome*` and each
 becomes a topic, with the Europe PMC query drafted via Groq (topic-draft-prompt.md).
 Every reply carries a "Generate report now" inline button.
 
@@ -91,7 +91,7 @@ WELCOME_TEXT = (
     "  - an infographic summary you can read in 10 seconds\n"
     "  - the full digest file, to drop into NotebookLM for a deep dive\n\n"
     "To set your topics, send them wrapped in asterisks:\n"
-    "*respiration and the brain* *psychedelics* *neurofeedback*\n\n"
+    "*sleep and memory* *gut microbiome* *CRISPR gene therapy*\n\n"
     "Add more any time the same way -- just send *your new topic*.\n\n"
     "Reports go out automatically once a week -- send /schedule to make that daily, "
     "monthly, or anything in between. Use the button below (or /report) for one right "
@@ -172,7 +172,7 @@ def handle_topics(chat_id: str, reply) -> None:
     cfg = yaml.safe_load(chats_store.topics_path(chat_id).read_text(encoding="utf-8")) or {}
     topics = cfg.get("topics") or []
     if not topics:
-        reply("No topics yet. Send them wrapped in asterisks, e.g.\n*psychedelics* *neurofeedback*")
+        reply("No topics yet. Send them wrapped in asterisks, e.g.\n*sleep and memory* *gut microbiome*")
         return
     lines = [f"- {t.get('name', 'Unnamed')}" + ("" if t.get("enabled", True) else "  (off)")
              for t in topics]
@@ -419,7 +419,7 @@ def generate_report_now(chat_id: str, reply, scheduled: bool = False) -> None:
     if not any(t.get("enabled", True) for t in (cfg.get("topics") or [])):
         if not scheduled:
             reply("You have no topics yet, so there's nothing to report on.\n\n"
-                  "Send them wrapped in asterisks, e.g. *psychedelics* *neurofeedback*")
+                  "Send them wrapped in asterisks, e.g. *sleep and memory* *gut microbiome*")
         return
 
     with _running_lock:
