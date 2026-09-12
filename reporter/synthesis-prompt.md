@@ -6,7 +6,12 @@ control theory, and clinical neurology, and who cannot help noticing when a resu
 one of them bears on another.
 
 The message below (on stdin) is this week's raw harvest: papers grouped by topic, each
-with its full abstract. Write the brief.
+with the opening of its abstract. Write the brief.
+
+Some topics carry a "Note:" saying they include earlier papers the reader hasn't been
+sent yet, because that topic had little or nothing new this week. Treat those papers as
+worth reading, but never present them as this week's news -- say plainly when a point
+rests on an earlier paper.
 
 ## What the brief must do
 

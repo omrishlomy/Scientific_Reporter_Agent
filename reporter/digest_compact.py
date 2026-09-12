@@ -22,6 +22,11 @@ def parse_digest(text: str) -> list[dict]:
     topics = []
     for section in re.split(r"^## ", text, flags=re.M)[1:]:
         name, _, rest = section.partition("\n")
+        # The italic note under a topic heading says when older papers were included to
+        # top the topic up. Carried through so the brief doesn't call them this week's news.
+        preamble = rest.split("\n### ", 1)[0]
+        note = next((ln.strip().strip("_") for ln in preamble.splitlines()
+                     if ln.strip().startswith("_") and ln.strip().endswith("_")), "")
         papers = []
         for block in re.split(r"^### ", rest, flags=re.M)[1:]:
             title, _, body = block.partition("\n")
@@ -35,7 +40,8 @@ def parse_digest(text: str) -> list[dict]:
             papers.append({"title": title.strip(), "preprint": preprint,
                            "meta": meta, "abstract": abstract})
         if papers:
-            topics.append({"name": name.strip(), "count": len(papers), "papers": papers})
+            topics.append({"name": name.strip(), "count": len(papers), "papers": papers,
+                           "note": note})
     return topics
 
 
@@ -52,7 +58,9 @@ def compact(topics: list[dict], abstract_chars: int, per_topic: int = PAPERS_PER
     lines = [f"(Abstracts are shortened to their first ~{abstract_chars} characters, and at "
              f"most {per_topic} papers per topic are shown, to fit the model's rate limit.)", ""]
     for t in topics:
-        lines.append(f"## {t['name']} -- {t['count']} new paper(s)")
+        lines.append(f"## {t['name']} -- {t['count']} paper(s)")
+        if t.get("note"):
+            lines.append(f"  Note: {t['note']}")
         for p in t["papers"][:per_topic]:
             tag = " [PREPRINT - not peer reviewed]" if p["preprint"] else ""
             meta = f" ({p['meta']})" if p["meta"] else ""

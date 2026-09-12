@@ -63,34 +63,6 @@ def save_seen(seen: set[str], seen_file: pathlib.Path) -> None:
     seen_file.write_text(json.dumps(trimmed, indent=0), encoding="utf-8")
 
 
-def search(query: str, since: dt.date, limit: int, preprints: bool) -> list[dict]:
-    """One Europe PMC query, newest first, restricted to a date window."""
-    date_clause = f'(FIRST_PDATE:[{since.isoformat()} TO {dt.date.today().isoformat()}])'
-    full = f"({query.strip()}) AND {date_clause}"
-    if not preprints:
-        full += ' AND (SRC:"MED")'
-
-    params = {
-        "query": full,
-        "format": "json",
-        "pageSize": str(min(limit, 100)),
-        "resultType": "core",          # 'core' is what includes abstractText
-        "sort": "P_PDATE_D desc",
-    }
-    url = f"{API}?{urllib.parse.urlencode(params)}"
-    req = urllib.request.Request(url, headers={"User-Agent": UA})
-
-    try:
-        with urllib.request.urlopen(req, timeout=TIMEOUT) as resp:
-            data = json.loads(resp.read().decode("utf-8"))
-    except (urllib.error.URLError, TimeoutError, json.JSONDecodeError) as e:
-        # One topic failing must not lose the whole digest.
-        print(f"WARN query failed ({e}); skipping topic", file=sys.stderr)
-        return []
-
-    return data.get("resultList", {}).get("result", [])
-
-
 def uid(paper: dict) -> str:
     """Stable identity for dedup. DOI when present, else the Europe PMC id."""
     doi = (paper.get("doi") or "").strip().lower()
@@ -184,6 +156,68 @@ def build_sources(sources: list[tuple[str, dict]], today: dt.date) -> str:
     return "\n".join(lines) + "\n"
 
 
+# When a topic has fewer than min_per_topic unseen papers in the normal lookback window,
+# the search walks further back in these steps. "Nothing new this week" was a dead end
+# for the reader; an earlier paper they haven't been sent is still worth reading, as long
+# as the digest is honest that it isn't new.
+BACKFILL_WINDOWS_DAYS = (30, 90, 365, 1825)
+MAX_PAGES = 5   # per query slice; up to 500 records scanned for unseen papers
+
+
+def search_page(query: str, since: dt.date, until: dt.date, page_size: int,
+                preprints: bool, cursor: str) -> tuple[list[dict], str | None]:
+    """One page of a Europe PMC query, newest first, within [since, until]."""
+    date_clause = f"(FIRST_PDATE:[{since.isoformat()} TO {until.isoformat()}])"
+    full = f"({query.strip()}) AND {date_clause}"
+    if not preprints:
+        full += ' AND (SRC:"MED")'
+    params = {
+        "query": full,
+        "format": "json",
+        "pageSize": str(page_size),
+        "resultType": "core",          # 'core' is what includes abstractText
+        "sort": "P_PDATE_D desc",
+        "cursorMark": cursor,
+    }
+    url = f"{API}?{urllib.parse.urlencode(params)}"
+    req = urllib.request.Request(url, headers={"User-Agent": UA})
+    with urllib.request.urlopen(req, timeout=TIMEOUT) as resp:
+        data = json.loads(resp.read().decode("utf-8"))
+    return data.get("resultList", {}).get("result", []), data.get("nextCursorMark")
+
+
+def collect_unseen(query: str, since: dt.date, until: dt.date, want: int,
+                   preprints: bool, taken: set[str]) -> list[dict]:
+    """Pages newest-first until `want` papers not in `taken` are found, adding each one
+    to `taken`. Paging matters: once seen.json is large, the whole first page can be
+    papers already sent, and stopping there wrongly concludes there is nothing to show."""
+    found: list[dict] = []
+    if want <= 0 or since > until:
+        return found
+    cursor = "*"
+    page_size = min(100, max(25, want * 3))
+    for _ in range(MAX_PAGES):
+        try:
+            results, next_cursor = search_page(query, since, until, page_size, preprints, cursor)
+        except (urllib.error.URLError, TimeoutError, json.JSONDecodeError) as e:
+            # One failing query must not lose the whole digest.
+            print(f"WARN query failed ({e}); keeping what was found so far", file=sys.stderr)
+            break
+        for p in results:
+            u = uid(p)
+            if u in taken:
+                continue
+            taken.add(u)
+            found.append(p)
+            if len(found) >= want:
+                return found
+        if not results or not next_cursor or next_cursor == cursor:
+            break
+        cursor = next_cursor
+        time.sleep(0.3)                              # rate-limit courtesy
+    return found
+
+
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--dry-run", action="store_true", help="print instead of writing")
@@ -199,18 +233,22 @@ def main() -> int:
     settings = cfg.get("settings", {}) or {}
     days = args.days or int(settings.get("lookback_days", 7))
     cap = int(settings.get("max_per_topic", 8))
+    min_per_topic = max(1, min(cap, int(settings.get("min_per_topic", 3))))
     preprints = bool(settings.get("preprints", True))
-    since = dt.date.today() - dt.timedelta(days=days)
-
-    seen = load_seen(args.seen_file)
-    fresh: set[str] = set()
 
     today = dt.date.today()
+    since = today - dt.timedelta(days=days)
+    windows = [w for w in BACKFILL_WINDOWS_DAYS if w > days]
+
+    seen = load_seen(args.seen_file)
+    taken = set(seen)          # grows as papers are picked, so topics never share one
+
     body = [
         f"# Paper digest - {today.isoformat()}",
         "",
-        f"Papers first published between **{since.isoformat()}** and "
-        f"**{today.isoformat()}**, excluding anything covered in an earlier digest.",
+        f"Papers first published between **{since.isoformat()}** and **{today.isoformat()}** "
+        f"that no earlier digest covered. Topics with fewer than {min_per_topic} of those are "
+        "topped up with earlier papers you haven't been sent yet, and say so below.",
         "",
         "---",
         "",
@@ -224,32 +262,47 @@ def main() -> int:
         if not topic.get("enabled", True):
             continue
         name = topic.get("name", "Unnamed topic")
-        results = search(topic["query"], since, cap * 3, preprints)
+
+        papers = collect_unseen(topic["query"], since, today, cap, preprints, taken)
+        new_count = len(papers)
         time.sleep(0.5)                              # rate-limit courtesy
 
-        new = []
-        for p in results:
-            u = uid(p)
-            if u in seen or u in fresh:
-                continue
-            fresh.add(u)
-            new.append(p)
-            if len(new) >= cap:
+        # Walk back through non-overlapping older slices, so already-scanned recent
+        # results aren't paged through again on every widening step.
+        widest = days
+        upper = since - dt.timedelta(days=1)
+        for w in windows:
+            if len(papers) >= min_per_topic:
                 break
+            lower = today - dt.timedelta(days=w)
+            papers += collect_unseen(topic["query"], lower, upper, cap - len(papers),
+                                     preprints, taken)
+            widest = w
+            upper = lower - dt.timedelta(days=1)
+            time.sleep(0.5)
 
-        per_topic_counts.append((name, len(new)))
-        total += len(new)
-        sources.extend((name, p) for p in new)
+        backfilled = len(papers) - new_count
+        per_topic_counts.append((name, new_count, backfilled))
+        total += len(papers)
+        sources.extend((name, p) for p in papers)
 
         body += [f"## {name}", ""]
-        if not new:
-            body += ["_Nothing new this week._", ""]
+        if not papers:
+            body += [f"_No papers you haven't already been sent, even searching back {widest} "
+                     "days. This topic may be too narrow._", ""]
         else:
-            body += [format_paper(p) for p in new]
+            if backfilled:
+                lead = (f"No new papers in the last {days} days" if new_count == 0
+                        else f"Only {new_count} new paper(s) in the last {days} days")
+                body += [f"_{lead} -- also including {backfilled} earlier paper(s) you haven't "
+                         f"been sent, from up to {widest} days back._", ""]
+            body += [format_paper(p) for p in papers]
         body += ["---", ""]
 
-    summary = ", ".join(f"{n}: {c}" for n, c in per_topic_counts)
-    body.insert(4, f"**{total} new paper(s)** - {summary}")
+    fresh = {uid(p) for _, p in sources}
+    summary = ", ".join(f"{n}: {c}" + (f" (+{b} earlier)" if b else "")
+                        for n, c, b in per_topic_counts)
+    body.insert(4, f"**{total} paper(s)** - {summary}")
     body.insert(5, "")
 
     text = "\n".join(body)

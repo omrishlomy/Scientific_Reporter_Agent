@@ -122,8 +122,14 @@ def process_chat(chat_id: str, today: str) -> None:
     log(chat_id, f"{count} new paper(s) -> {digest_path}")
 
     if count == 0:
+        # Only reachable now if a topic matches nothing unseen even several years back
+        # (fetch_papers tops thin topics up from earlier papers), so the useful thing to
+        # say is that the topics are probably too narrow -- not "nothing new this week".
         sh([sys.executable, str(HERE / "telegram_notify.py"), "--chat-id", chat_id,
-            "--message", "Weekly paper digest: nothing new this week."])
+            "--message", "I couldn't find any papers you haven't already been sent, even "
+                         "searching several years back. Your topics may be too narrow -- "
+                         "send /topics to review them, or add broader ones like "
+                         "*sleep and memory*."])
         return
 
     digest_text = pathlib.Path(digest_path).read_text(encoding="utf-8")
@@ -192,7 +198,9 @@ def process_chat(chat_id: str, today: str) -> None:
             infographic_path = None
 
     # --- 5. notify ------------------------------------------------------------
-    subject = f"Weekly paper digest - {count} new paper(s)"
+    # Not "new": thin topics are topped up with earlier unseen papers, and the digest
+    # and brief say which ones those are.
+    subject = f"Paper digest - {count} paper(s)"
     tg_message = subject
     if brief_prose:
         preview = brief_prose[:3300] + "..." if len(brief_prose) > 3300 else brief_prose
