@@ -1,4 +1,8 @@
-FROM python:3.12-slim
+# Same official image, pulled from AWS ECR Public's mirror of Docker Official Images
+# instead of Docker Hub. A Railway build failed with an i/o timeout resolving
+# registry-1.docker.io before touching any of this repo's code, and Docker Hub also
+# rate-limits anonymous pulls; the mirror avoids both.
+FROM public.ecr.aws/docker/library/python:3.12-slim
 
 WORKDIR /app
 
