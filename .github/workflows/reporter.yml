@@ -1,12 +1,12 @@
 name: Weekly paper digest
 
 on:
-  schedule:
-    # Monday 08:00 Israel time. GitHub Actions cron is always UTC and does not shift
-    # for daylight saving, so this comment is the source of truth if the offset drifts
-    # -- IDT is UTC+3 (summer) / IST is UTC+2 (winter); 05:00 UTC covers the summer
-    # case (08:00 IDT). Adjust by an hour around the clock-change weekends if it matters.
-    - cron: '0 5 * * 1'
+  # DISABLED: the Railway service runs the weekly digest in-process (APScheduler, see
+  # server.py). Leaving this schedule on would deliver every chat two digests a week.
+  # If Railway is ever retired, restore the two lines below.
+  #   schedule:
+  #     - cron: '0 5 * * 1'   # Monday 05:00 UTC = 08:00 IDT (summer); Actions cron is
+  #                           # always UTC and does not shift for daylight saving.
   workflow_dispatch: {}   # lets you trigger a run manually from the Actions tab
 
 permissions:

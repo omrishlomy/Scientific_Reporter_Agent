@@ -49,6 +49,61 @@ Two reasons, both load-bearing:
 Nothing sensitive lives here: topic keywords, paper DOIs already reported (`seen.json`),
 and the pipeline code itself.
 
+## Deployment: Railway (webhook) -- replaces the GitHub Actions polling setup
+
+The bot runs as a small FastAPI service (`server.py`) on Railway. It receives Telegram
+**webhooks**, so messages and button presses are handled the instant they're sent, and
+runs the weekly digest in-process via APScheduler.
+
+**This is a separate Railway service from any other project** -- its own service, its
+own volume, its own variables. Nothing is shared.
+
+### Why this replaced GitHub Actions
+
+Actions fired the poller every **120-280 minutes** despite a `*/5` cron (measured over
+21 runs; GitHub throttles scheduled workflows on free public repos). Every topic added
+and every "generate report" press waited hours. A persistent service has no such limit.
+
+### Railway setup
+
+1. **New service** in your Railway project -> Deploy from GitHub repo ->
+   `omrishlomy/Scientific_Reporter_Agent`. It builds from the `Dockerfile`
+   (`railway.json` pins the Dockerfile builder, same convention as your other project).
+2. **Add a Volume**, mount path **`/data`**. This is not optional: Railway's container
+   filesystem is wiped on every redeploy, and `/data` is where topics and
+   already-seen-paper history live. Without it, every deploy resets all chats.
+   On first boot the service copies any chats bundled in the repo into the empty volume,
+   so the existing setup carries over automatically.
+3. **Variables:**
+
+   | Variable | Value |
+   |---|---|
+   | `TELEGRAM_BOT_TOKEN` | same BotFather token as before |
+   | `GROQ_API_KEY` | same Groq key |
+   | `TELEGRAM_WEBHOOK_SECRET` | any random string you invent (see below) |
+   | `PUBLIC_URL` | the service's public URL, e.g. `https://xxx.up.railway.app` |
+   | `DATA_DIR` | `/data` (already set in the Dockerfile; override only if you mount elsewhere) |
+   | `TIMEZONE` | `Asia/Jerusalem` (default) |
+   | `REPORT_CRON_DAY` / `REPORT_CRON_HOUR` | `mon` / `8` (default) |
+
+   `TELEGRAM_WEBHOOK_SECRET` matters: the webhook URL is public, and without a shared
+   secret anyone who found it could POST fake updates to add topics or trigger reports.
+   Telegram echoes the secret on every call and the service rejects anything else with
+   a 403.
+4. **Generate a domain** for the service (Railway -> Settings -> Networking), then set
+   `PUBLIC_URL` to it and redeploy. On startup the service calls `setWebhook` itself --
+   check the deploy logs for `setWebhook -> 200`.
+5. Message the bot. The reply should be immediate.
+
+### The GitHub Actions workflows are now disabled on purpose
+
+**Telegram permits either `getUpdates` or a webhook, never both** -- whichever runs
+second gets HTTP 409, and a stray `getUpdates` can knock the webhook offline. Both
+workflow schedules are therefore commented out, leaving only `workflow_dispatch` as a
+manual fallback. Do not re-enable the `telegram-bot.yml` schedule while Railway is
+live. The weekly `reporter.yml` schedule is off for a different reason: Railway already
+runs the weekly digest, and both running would send every chat two digests.
+
 ## Multi-tenant: works in any number of Telegram chats
 
 There's no fixed "chat ID" to configure -- **any chat that messages the bot

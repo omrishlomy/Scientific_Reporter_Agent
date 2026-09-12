@@ -1,4 +1,11 @@
+# Reporter pipeline
 pyyaml
+ruamel.yaml
 requests
 matplotlib
-ruamel.yaml
+
+# Railway service (webhook + weekly scheduler)
+fastapi
+uvicorn[standard]
+apscheduler
+tzdata

@@ -15,9 +15,13 @@ name: Telegram topic manager
 # separate repos over exactly this concern.
 
 on:
-  schedule:
-    - cron: '*/5 * * * *'
-  workflow_dispatch: {}
+  # DISABLED: superseded by the Railway webhook service (see server.py).
+  # Telegram permits either getUpdates or a webhook, never both -- whichever runs
+  # second gets HTTP 409, and a getUpdates call can knock the webhook offline. Do not
+  # re-enable this schedule while the Railway service is deployed.
+  #   schedule:
+  #     - cron: '*/5 * * * *'
+  workflow_dispatch: {}   # manual fallback only, e.g. if Railway is down
 
 permissions:
   contents: write   # commits new/updated chats/ files and the update-id offset file

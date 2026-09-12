@@ -312,6 +312,66 @@ def generate_report_now(chat_id: str, reply) -> None:
         reply(f"Report generation failed: {e}")
 
 
+def handle_update(token: str, upd: dict) -> None:
+    """Processes a single Telegram update. Shared by both transports: the GitHub Actions
+    poller (getUpdates) and the Railway webhook. Keeping one implementation means the two
+    can never drift apart in behaviour -- only in how the update arrives."""
+
+    # --- button presses ----------------------------------------------------------
+    cb = upd.get("callback_query")
+    if cb:
+        chat = (cb.get("message") or {}).get("chat") or {}
+        chat_id = str(chat.get("id", ""))
+        if not chat_id:
+            return
+        answer_callback(token, cb.get("id", ""), "Starting...")
+        chats_store.register_chat(chat_id, chat.get("title") or chat.get("first_name", ""))
+        reply = lambda t: send(token, chat_id, t)
+        if cb.get("data") == "gen_report":
+            generate_report_now(chat_id, reply)
+        return
+
+    # --- text messages -----------------------------------------------------------
+    msg = upd.get("message")
+    if not msg or "text" not in msg:
+        return
+
+    chat_id = str(msg["chat"]["id"])
+    chat_name = msg["chat"].get("title") or msg["chat"].get("username") or msg["chat"].get("first_name", "")
+    text = msg["text"].strip()
+    reply = lambda t: send(token, chat_id, t)
+
+    is_new = chats_store.register_chat(chat_id, chat_name)
+    if is_new:
+        # New chat: always greet first, then still act on the message if it actually
+        # carried topics, so `*sleep*` as a first contact isn't ignored.
+        reply(WELCOME_TEXT)
+        if not parse_asterisk_topics(text):
+            return
+
+    topics_in_msg = parse_asterisk_topics(text)
+
+    if text in ("/help", "/start"):
+        reply(HELP_TEXT if text == "/help" else WELCOME_TEXT)
+    elif text == "/topics":
+        handle_topics(chat_id, reply)
+    elif text in ("/report", "/reportnow"):
+        generate_report_now(chat_id, reply)
+    elif text.startswith("/addtopic"):
+        handle_addtopic(chat_id, text[len("/addtopic"):].strip(), reply)
+    elif text.startswith("/removetopic"):
+        handle_removetopic(chat_id, text[len("/removetopic"):].strip(), reply)
+    elif text.startswith("/"):
+        reply("Unknown command. Send /help for the list.")
+    elif topics_in_msg:
+        handle_asterisk_topics(chat_id, topics_in_msg, reply)
+    else:
+        # Anything else gets the greeting + instructions rather than being guessed at
+        # as a topic -- guessing is how a plain "hi" once became a TITLE:* topic that
+        # would have matched every paper in the database.
+        reply(WELCOME_TEXT)
+
+
 def main() -> int:
     token = os.environ.get("TELEGRAM_BOT_TOKEN")
     if not token:
@@ -341,60 +401,7 @@ def main() -> int:
 
     for upd in updates:
         max_update_id = max(max_update_id, upd["update_id"])
-
-        # --- button presses ------------------------------------------------------
-        cb = upd.get("callback_query")
-        if cb:
-            chat = (cb.get("message") or {}).get("chat") or {}
-            chat_id = str(chat.get("id", ""))
-            if not chat_id:
-                continue
-            answer_callback(token, cb.get("id", ""), "Starting...")
-            chats_store.register_chat(chat_id, chat.get("title") or chat.get("first_name", ""))
-            reply = lambda t: send(token, chat_id, t)
-            if cb.get("data") == "gen_report":
-                generate_report_now(chat_id, reply)
-            continue
-
-        # --- text messages -------------------------------------------------------
-        msg = upd.get("message")
-        if not msg or "text" not in msg:
-            continue
-
-        chat_id = str(msg["chat"]["id"])
-        chat_name = msg["chat"].get("title") or msg["chat"].get("username") or msg["chat"].get("first_name", "")
-        text = msg["text"].strip()
-        reply = lambda t: send(token, chat_id, t)
-
-        is_new = chats_store.register_chat(chat_id, chat_name)
-        if is_new:
-            # New chat: always greet first, then still act on the message if it
-            # actually carried topics, so `*sleep*` as a first contact isn't ignored.
-            reply(WELCOME_TEXT)
-            if not parse_asterisk_topics(text):
-                continue
-
-        topics_in_msg = parse_asterisk_topics(text)
-
-        if text in ("/help", "/start"):
-            reply(HELP_TEXT if text == "/help" else WELCOME_TEXT)
-        elif text == "/topics":
-            handle_topics(chat_id, reply)
-        elif text in ("/report", "/reportnow"):
-            generate_report_now(chat_id, reply)
-        elif text.startswith("/addtopic"):
-            handle_addtopic(chat_id, text[len("/addtopic"):].strip(), reply)
-        elif text.startswith("/removetopic"):
-            handle_removetopic(chat_id, text[len("/removetopic"):].strip(), reply)
-        elif text.startswith("/"):
-            reply("Unknown command. Send /help for the list.")
-        elif topics_in_msg:
-            handle_asterisk_topics(chat_id, topics_in_msg, reply)
-        else:
-            # Anything else gets the greeting + instructions rather than being guessed
-            # at as a topic -- guessing is how a plain "hi" once became a TITLE:* topic
-            # that would have matched every paper in the database.
-            reply(WELCOME_TEXT)
+        handle_update(token, upd)
 
     if max_update_id > offset:
         save_offset(max_update_id)

@@ -1,0 +1,12 @@
+.venv/
+venv/
+__pycache__/
+*.pyc
+*.pyo
+.idea/
+.claude/
+.git/
+.github/
+reporter-output/
+models/
+llamacpp-bin/
