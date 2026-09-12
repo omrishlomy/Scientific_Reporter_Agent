@@ -431,7 +431,9 @@ def generate_report_now(chat_id: str, reply, scheduled: bool = False) -> None:
 
     try:
         if not scheduled:
-            reply("Working on it -- searching for new papers. This takes a minute.")
+            # Honest estimate: calls are paced under Groq's free-tier 8K tokens/minute,
+            # so a report with several topics spans a few minutes by design.
+            reply("Working on it -- searching for new papers. This usually takes 2-4 minutes.")
         chats_store.mark_report_started(chat_id)
         from datetime import date
         import run_reporter_cloud

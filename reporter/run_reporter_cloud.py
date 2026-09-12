@@ -128,34 +128,46 @@ def process_chat(chat_id: str, today: str) -> None:
 
     digest_text = pathlib.Path(digest_path).read_text(encoding="utf-8")
 
-    # --- 2. synthesis (Groq-hosted open-weights model) --------------------------
+    # The LLM calls get a COMPACT view of the digest, never the raw file. A normal week is
+    # ~13K tokens; Groq's free tier caps a request at 8K tokens/minute, so the raw digest
+    # was rejected outright and both the brief and the infographic silently disappeared.
+    # The full digest still goes to the user for NotebookLM.
     from local_llm import run_prompt   # imported here so --help works without GROQ_API_KEY set
+    import digest_compact
 
+    topics = digest_compact.parse_digest(digest_text)
+
+    # --- 2. synthesis -----------------------------------------------------------
     synthesis_prompt = (HERE / "synthesis-prompt.md").read_text(encoding="utf-8")
     try:
-        # Generous budget: unlike the retired CPU-inference path, more tokens here
-        # cost seconds on Groq's hardware, not extra tens of minutes.
-        brief_prose = run_prompt(synthesis_prompt, digest_text, max_tokens=2000)
+        brief_prose = run_prompt(synthesis_prompt,
+                                 digest_compact.compact(topics, abstract_chars=350),
+                                 max_tokens=2500, reasoning_effort="medium")
         brief_prose = re.sub(r"^\s*#\s+[^\n]*\n+", "", brief_prose)   # drop a stray H1
     except Exception as e:
         log(chat_id, f"synthesis failed: {e}; continuing without a brief")
         brief_prose = ""
 
-    # --- 3. infographic data: grounded in the RAW DIGEST, not the brief ---------
+    # --- 3. infographic data: one call per topic ---------------------------------
+    # Per topic keeps each request small, and means one bad topic costs one card rather
+    # than the whole infographic. Counts and names come from the digest itself, not the
+    # model, so a card can never disagree with the digest it summarises.
     infographic_prompt = (HERE / "infographic-prompt.md").read_text(encoding="utf-8")
-    json_block = None
-    for attempt in (1, 2):
+    cards = []
+    for t in topics:
         try:
-            json_raw = run_prompt(infographic_prompt, digest_text, max_tokens=3000,
-                                   json_schema=INFOGRAPHIC_SCHEMA)
-            json_raw = re.sub(r"^```(json)?\s*", "", json_raw.strip())
-            json_raw = re.sub(r"```\s*$", "", json_raw)
-            json.loads(json_raw)   # validate before trusting it -- syntax only; strict
-                                    # mode already guarantees the schema itself
-            json_block = json_raw
-            break
+            raw = run_prompt(infographic_prompt, digest_compact.compact([t], abstract_chars=700),
+                             max_tokens=1500, json_schema=INFOGRAPHIC_SCHEMA,
+                             reasoning_effort="low")
+            raw = re.sub(r"```\s*$", "", re.sub(r"^```(json)?\s*", "", raw.strip()))
+            items = json.loads(raw).get("topics") or []
+            if items:
+                card = items[0]
+                card["name"], card["count"] = t["name"], t["count"]
+                cards.append(card)
         except Exception as e:
-            log(chat_id, f"infographic-data attempt {attempt} failed: {e}")
+            log(chat_id, f"infographic data failed for topic {t['name']!r}: {e}")
+    json_block = json.dumps({"topics": cards}, ensure_ascii=False, indent=2) if cards else None
 
     # --- write the brief file ----------------------------------------------------
     brief_path = unique_path(out_dir, f"brief-{today}", ".md")
@@ -183,8 +195,22 @@ def process_chat(chat_id: str, today: str) -> None:
     subject = f"Weekly paper digest - {count} new paper(s)"
     tg_message = subject
     if brief_prose:
-        preview = brief_prose[:3500] + "..." if len(brief_prose) > 3500 else brief_prose
+        preview = brief_prose[:3300] + "..." if len(brief_prose) > 3300 else brief_prose
         tg_message = f"{subject}\n\n{preview}"
+
+    # Say so when a part is missing. Before this, a failed brief or infographic just
+    # vanished and the report looked complete -- which hid a rate-limit failure that had
+    # been breaking both on every run.
+    missing = []
+    if not brief_prose:
+        missing.append("the written brief")
+    if not infographic_path:
+        missing.append("the infographic")
+    elif len(cards) < len(topics):
+        missing.append(f"infographic cards for {len(topics) - len(cards)} topic(s)")
+    if missing:
+        tg_message += ("\n\n(Couldn't generate " + " and ".join(missing) +
+                       " this time -- the full digest file below is complete.)")
 
     tg_cmd = [sys.executable, str(HERE / "telegram_notify.py"), "--chat-id", chat_id,
               "--message", tg_message, "--document", digest_path]
