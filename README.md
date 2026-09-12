@@ -107,8 +107,22 @@ migration.
 
 - **Groq free tier has rate limits**, shared across all chats using this bot. Fine at
   small scale -- see https://console.groq.com/docs/rate-limits if this grows a lot.
-- **Topic commands land within ~5 minutes, not instantly** -- a consequence of Actions
-  runners being ephemeral rather than a persistent bot process.
+- **Topic commands can take HOURS to land, not the ~5 minutes the cron implies.**
+  The workflow is scheduled `*/5` but GitHub heavily throttles scheduled workflows on
+  free/public repos. Measured over 21 real runs, actual gaps were **120-280 minutes**
+  (2-4.5 hours), never 5. GitHub documents that "the schedule event can be delayed
+  during periods of high load" -- in practice that delay is the norm here, not the
+  exception. Lowering the cron interval does not help; the scheduler, not the cron
+  expression, is the limit.
+  - Need a topic added *now*? Trigger the workflow by hand: Actions tab -> "Telegram
+    topic manager" -> Run workflow. That runs within seconds.
+  - Want genuinely instant replies? That needs a Telegram *webhook* pointed at a
+    persistent HTTPS endpoint, which Actions fundamentally cannot provide (ephemeral
+    runners, no inbound URL). A free serverless function (e.g. Cloudflare Workers)
+    could host it -- a separate piece of infrastructure, not a tweak to this repo.
+- **Telegram only retains pending updates for ~24 hours.** If the bot is broken or
+  paused for longer than that, messages sent in the meantime are dropped by Telegram
+  and can never be recovered -- you just send a new one.
 - **Plain-English topic drafting can misfire** -- it's one Groq call with no human
   review before the topic is saved. If a drafted query looks wrong, `/removetopic
   <name>` and try again with different wording, or use `/addtopic <name> | <query>`
