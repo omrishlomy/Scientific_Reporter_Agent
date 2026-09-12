@@ -23,7 +23,8 @@ from __future__ import annotations
 import logging
 import os
 import sys
-from datetime import date
+import time
+from datetime import date, datetime, timezone
 from pathlib import Path
 
 import requests
@@ -45,25 +46,39 @@ TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")
 # to -- which here would mean adding topics or triggering report generation at will.
 WEBHOOK_SECRET = os.environ.get("TELEGRAM_WEBHOOK_SECRET", "")
 PUBLIC_URL = os.environ.get("PUBLIC_URL", "")   # e.g. https://<service>.up.railway.app
-REPORT_CRON_DAY = os.environ.get("REPORT_CRON_DAY", "mon")
-REPORT_CRON_HOUR = int(os.environ.get("REPORT_CRON_HOUR", "8"))
 TIMEZONE = os.environ.get("TIMEZONE", "Asia/Jerusalem")
 
 app = FastAPI(title="Scientific Reporter")
 scheduler = BackgroundScheduler(timezone=TIMEZONE)
 
 
-def run_weekly_digest() -> None:
+def scheduler_tick() -> None:
+    """Runs hourly and sends to whichever chats are due.
+
+    Deliberately a due-check rather than one cron per chat: each chat sets its own
+    interval (/schedule), so cron jobs would have to be added/removed as users change
+    settings, and a fire missed during a restart or redeploy would simply be lost.
+    A tick that asks "is this chat overdue?" self-heals -- a chat that was due while the
+    service was down goes out on the next tick instead of waiting a full interval."""
+    now = datetime.now(timezone.utc)
     today = date.today().isoformat()
-    chat_ids = chats_store.list_chat_ids()
-    log.info("weekly digest starting for %d chat(s)", len(chat_ids))
-    for chat_id in chat_ids:
+    due = [c for c in chats_store.list_chat_ids() if chats_store.is_due(c, now)]
+    if not due:
+        return
+    log.info("tick: %d chat(s) due", len(due))
+    for chat_id in due:
         try:
-            run_reporter_cloud.process_chat(chat_id, today)
+            # Goes through generate_report_now for the concurrency guard and the
+            # last_report_at stamp, so a scheduled run and a button press can't overlap.
+            bot_poll.generate_report_now(
+                chat_id, lambda t, c=chat_id: bot_poll.send(TOKEN, c, t), scheduled=True)
         except Exception:
             # One chat's failure must not cancel everyone else's digest.
-            log.exception("weekly digest failed for chat %s", chat_id)
-    log.info("weekly digest finished")
+            log.exception("scheduled digest failed for chat %s", chat_id)
+        # Telegram rate-limits bulk sending (~30 messages/sec overall); a small gap
+        # between chats keeps a large roster from tripping it.
+        time.sleep(2)
+    log.info("tick finished")
 
 
 def register_webhook() -> None:
@@ -95,11 +110,12 @@ def on_startup() -> None:
 
     register_webhook()
 
-    scheduler.add_job(run_weekly_digest, "cron", day_of_week=REPORT_CRON_DAY,
-                      hour=REPORT_CRON_HOUR, minute=0, id="weekly_digest",
-                      replace_existing=True, misfire_grace_time=3600)
+    scheduler.add_job(scheduler_tick, "interval", hours=1, id="digest_tick",
+                      replace_existing=True, misfire_grace_time=3600,
+                      coalesce=True, max_instances=1)
     scheduler.start()
-    log.info("weekly digest scheduled: %s %02d:00 %s", REPORT_CRON_DAY, REPORT_CRON_HOUR, TIMEZONE)
+    log.info("digest tick scheduled hourly; per-chat intervals default to %d days",
+             chats_store.DEFAULT_INTERVAL_DAYS)
 
 
 @app.on_event("shutdown")
@@ -110,10 +126,13 @@ def on_shutdown() -> None:
 
 @app.get("/")
 def root():
+    chats = chats_store.list_chat_ids()
     return {
         "service": "Scientific Reporter",
-        "chats": len(chats_store.list_chat_ids()),
-        "weekly": f"{REPORT_CRON_DAY} {REPORT_CRON_HOUR:02d}:00 {TIMEZONE}",
+        "chats": len(chats),
+        "paused": sum(1 for c in chats if chats_store.is_paused(c)),
+        "tick": "hourly; each chat has its own interval (default "
+                f"{chats_store.DEFAULT_INTERVAL_DAYS} days)",
     }
 
 

@@ -84,7 +84,10 @@ and every "generate report" press waited hours. A persistent service has no such
    | `PUBLIC_URL` | the service's public URL, e.g. `https://xxx.up.railway.app` |
    | `DATA_DIR` | `/data` (already set in the Dockerfile; override only if you mount elsewhere) |
    | `TIMEZONE` | `Asia/Jerusalem` (default) |
-   | `REPORT_CRON_DAY` / `REPORT_CRON_HOUR` | `mon` / `8` (default) |
+
+   There is deliberately no global schedule variable -- **each chat sets its own
+   interval** via `/schedule` (see below). The service just ticks hourly and sends to
+   whoever is due.
 
    `TELEGRAM_WEBHOOK_SECRET` matters: the webhook URL is public, and without a shared
    secret anyone who found it could POST fake updates to add topics or trigger reports.
@@ -117,6 +120,26 @@ is in play.
   `reporter/topic-draft-prompt.md`. Or use `/addtopic <name> | <exact query>` if you
   want to write the query yourself.
 - `/topics` lists that chat's topics, `/removetopic <name>` disables one.
+- **Each chat picks its own delivery interval** with `/schedule` -- `daily`, `weekly`
+  (default), `2w`, `10d`, `monthly`, anything from 1 to 90 days. `/pause` and `/resume`
+  stop and restart delivery without losing topics, and `/status` shows topics,
+  interval, and last/next report.
+
+### Scheduling design: hourly due-check, not a cron per chat
+
+The service ticks hourly and asks each chat "are you overdue?", rather than registering
+a cron job per chat. Two reasons:
+
+- Chats change their own interval at runtime, so cron jobs would have to be added and
+  removed as users send `/schedule`.
+- A cron fire missed during a redeploy or restart is simply lost. A due-check
+  self-heals: a chat that came due while the service was down goes out on the next
+  tick instead of waiting a whole interval.
+
+`last_report_at` is stamped when a run **begins**, not when it succeeds. If a run
+crashes halfway, that chat waits for its next interval rather than retrying the full
+pipeline on every tick -- a crash loop re-running an expensive job forever is a worse
+failure than one missed digest.
 - Each chat's state lives at `reporter/chats/<chat_id>/` (`topics.yaml`, `seen.json`,
   `meta.json`) -- dedup is per-chat on purpose: two chats interested in the same thing
   each still need to see a paper neither has been sent yet.

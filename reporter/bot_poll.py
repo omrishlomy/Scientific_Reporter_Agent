@@ -35,6 +35,7 @@ import os
 import pathlib
 import re
 import sys
+import threading
 
 import requests
 import yaml
@@ -92,9 +93,10 @@ WELCOME_TEXT = (
     "To set your topics, send them wrapped in asterisks:\n"
     "*respiration and the brain* *psychedelics* *neurofeedback*\n\n"
     "Add more any time the same way -- just send *your new topic*.\n\n"
-    "Reports go out automatically once a week. Use the button below (or /report) if you "
-    "want one sooner.\n\n"
-    "/topics to see your list  |  /help for everything else"
+    "Reports go out automatically once a week -- send /schedule to make that daily, "
+    "monthly, or anything in between. Use the button below (or /report) for one right "
+    "now.\n\n"
+    "/status to see your setup  |  /help for everything else"
 )
 
 HELP_TEXT = (
@@ -105,7 +107,11 @@ HELP_TEXT = (
     "Commands:\n"
     "/topics - list your topics\n"
     "/removetopic <name> - turn a topic off\n"
-    "/report - generate a report now instead of waiting for the weekly one\n"
+    "/report - generate a report right now\n"
+    "/schedule - how often reports arrive (default: every week)\n"
+    "    /schedule daily | weekly | 2w | 10d | monthly\n"
+    "/pause and /resume - stop/restart scheduled reports (topics are kept)\n"
+    "/status - topics, schedule, last and next report\n"
     "/help - this message\n\n"
     "Power user: /addtopic <name> | <exact Europe PMC query> skips the query drafting,\n"
     "  e.g. /addtopic Vagus nerve | (TITLE:\"vagus nerve\" OR TITLE:VNS) AND TITLE:brain"
@@ -130,7 +136,25 @@ def send(token: str, chat_id: str, text: str, button: bool = True) -> None:
     payload = {"chat_id": chat_id, "text": text[:4090]}
     if button:
         payload["reply_markup"] = json.dumps(REPORT_BUTTON)
-    requests.post(f"https://api.telegram.org/bot{token}/sendMessage", data=payload, timeout=30)
+    try:
+        r = requests.post(f"https://api.telegram.org/bot{token}/sendMessage",
+                          data=payload, timeout=30)
+    except requests.RequestException as e:
+        print(f"WARN send to {chat_id} failed: {e}", file=sys.stderr)
+        return
+
+    if r.status_code == 403:
+        # "Forbidden: bot was blocked by the user" / kicked from the group. Nothing we
+        # send will ever arrive again, so stop scheduling work for this chat instead of
+        # generating a full report for it every interval forever. /resume un-does this
+        # if they unblock and come back.
+        print(f"INFO chat {chat_id} blocked the bot; auto-pausing", file=sys.stderr)
+        try:
+            chats_store.update_meta(chat_id, paused=True, paused_reason="blocked_by_user")
+        except Exception:
+            pass
+    elif r.status_code != 200:
+        print(f"WARN sendMessage {r.status_code} for {chat_id}: {r.text[:200]}", file=sys.stderr)
 
 
 def answer_callback(token: str, callback_id: str, text: str = "") -> None:
@@ -245,6 +269,94 @@ def handle_natural_language(chat_id: str, text: str, reply) -> None:
     reply(msg)
 
 
+INTERVAL_WORDS = {
+    "daily": 1, "day": 1, "every day": 1,
+    "weekly": 7, "week": 7, "every week": 7,
+    "biweekly": 14, "fortnightly": 14, "two weeks": 14,
+    "monthly": 30, "month": 30,
+}
+
+
+def parse_interval(arg: str) -> int | None:
+    """Accepts '3d', '2w', '10 days', 'weekly', 'monthly', or a bare number of days.
+    Returns days, or None if it can't be understood."""
+    a = arg.strip().lower()
+    if not a:
+        return None
+    if a in INTERVAL_WORDS:
+        return INTERVAL_WORDS[a]
+    m = re.fullmatch(r"(\d+)\s*(d|day|days|w|wk|week|weeks|m|month|months)?", a)
+    if not m:
+        return None
+    n, unit = int(m.group(1)), (m.group(2) or "d")
+    if unit.startswith("w"):
+        n *= 7
+    elif unit.startswith("m"):
+        n *= 30
+    if not (chats_store.MIN_INTERVAL_DAYS <= n <= chats_store.MAX_INTERVAL_DAYS):
+        return None
+    return n
+
+
+def describe_interval(days: int) -> str:
+    return {1: "every day", 7: "every week", 14: "every 2 weeks",
+            30: "every month"}.get(days, f"every {days} days")
+
+
+def handle_schedule(chat_id: str, arg: str, reply) -> None:
+    if not arg.strip():
+        days = chats_store.get_interval_days(chat_id)
+        nxt = chats_store.next_due_at(chat_id)
+        reply(f"Reports: {describe_interval(days)}.\n"
+              f"Next one due: {nxt:%Y-%m-%d %H:%M} UTC\n\n"
+              "Change it with /schedule <interval>, e.g.\n"
+              "  /schedule daily\n  /schedule 3d\n  /schedule 2w\n  /schedule monthly")
+        return
+
+    days = parse_interval(arg)
+    if days is None:
+        reply(f"Didn't understand '{arg.strip()}'.\n\n"
+              "Try: /schedule daily | weekly | 2w | 10d | monthly\n"
+              f"(anything from {chats_store.MIN_INTERVAL_DAYS} to "
+              f"{chats_store.MAX_INTERVAL_DAYS} days)")
+        return
+
+    chats_store.update_meta(chat_id, interval_days=days)
+    nxt = chats_store.next_due_at(chat_id)
+    reply(f"Done -- reports now go out {describe_interval(days)}.\n"
+          f"Next one due: {nxt:%Y-%m-%d %H:%M} UTC")
+
+
+def handle_pause(chat_id: str, reply) -> None:
+    chats_store.update_meta(chat_id, paused=True)
+    reply("Paused -- no scheduled reports until you send /resume.\n"
+          "Your topics are kept, and you can still use /report any time.")
+
+
+def handle_resume(chat_id: str, reply) -> None:
+    chats_store.update_meta(chat_id, paused=False)
+    nxt = chats_store.next_due_at(chat_id)
+    reply(f"Resumed -- {describe_interval(chats_store.get_interval_days(chat_id))}.\n"
+          f"Next report due: {nxt:%Y-%m-%d %H:%M} UTC")
+
+
+def handle_status(chat_id: str, reply) -> None:
+    cfg = yaml.safe_load(chats_store.topics_path(chat_id).read_text(encoding="utf-8")) or {}
+    topics = [t for t in (cfg.get("topics") or []) if t.get("enabled", True)]
+    last = chats_store.last_report_at(chat_id)
+    paused = chats_store.is_paused(chat_id)
+    lines = [
+        f"Topics: {len(topics)} active" + (f" ({', '.join(t['name'] for t in topics[:5])}" +
+                                            (", ..." if len(topics) > 5 else "") + ")" if topics else ""),
+        f"Schedule: {describe_interval(chats_store.get_interval_days(chat_id))}"
+        + (" -- PAUSED" if paused else ""),
+        f"Last report: {last:%Y-%m-%d %H:%M} UTC" if last else "Last report: none yet",
+    ]
+    if not paused:
+        lines.append(f"Next report: {chats_store.next_due_at(chat_id):%Y-%m-%d %H:%M} UTC")
+    reply("\n".join(lines))
+
+
 def parse_asterisk_topics(text: str) -> list[str]:
     """Pulls *topic* segments out of a message. Multiple per message is the normal case
     -- `*sleep* *psychedelics*` should add two topics, not one."""
@@ -293,23 +405,43 @@ def handle_asterisk_topics(chat_id: str, wanted: list[str], reply) -> None:
     reply("\n\n".join(lines))
 
 
-def generate_report_now(chat_id: str, reply) -> None:
-    """Runs the full weekly pipeline for one chat, on demand. process_chat sends the
-    brief/infographic/digest to the chat itself, so nothing extra to deliver here."""
+# A report takes ~a minute. Without this, tapping the button twice (or tapping it while
+# the scheduled run is mid-flight) starts two pipelines for the same chat, which race on
+# that chat's seen.json and can deliver a duplicate or half-empty digest.
+_running: set[str] = set()
+_running_lock = threading.Lock()
+
+
+def generate_report_now(chat_id: str, reply, scheduled: bool = False) -> None:
+    """Runs the full pipeline for one chat. process_chat sends the brief/infographic/
+    digest to the chat itself, so nothing extra to deliver here."""
     cfg = yaml.safe_load(chats_store.topics_path(chat_id).read_text(encoding="utf-8")) or {}
     if not any(t.get("enabled", True) for t in (cfg.get("topics") or [])):
-        reply("You have no topics yet, so there's nothing to report on.\n\n"
-              "Send them wrapped in asterisks, e.g. *psychedelics* *neurofeedback*")
+        if not scheduled:
+            reply("You have no topics yet, so there's nothing to report on.\n\n"
+                  "Send them wrapped in asterisks, e.g. *psychedelics* *neurofeedback*")
         return
 
-    reply("Working on it -- searching for new papers. This takes a minute.")
+    with _running_lock:
+        if chat_id in _running:
+            if not scheduled:
+                reply("A report is already being generated for this chat -- hang on.")
+            return
+        _running.add(chat_id)
+
     try:
+        if not scheduled:
+            reply("Working on it -- searching for new papers. This takes a minute.")
+        chats_store.mark_report_started(chat_id)
         from datetime import date
         import run_reporter_cloud
         run_reporter_cloud.process_chat(chat_id, date.today().isoformat())
     except Exception as e:
-        print(f"ERROR on-demand report failed for {chat_id}: {e}", file=sys.stderr)
+        print(f"ERROR report failed for {chat_id}: {e}", file=sys.stderr)
         reply(f"Report generation failed: {e}")
+    finally:
+        with _running_lock:
+            _running.discard(chat_id)
 
 
 def handle_update(token: str, upd: dict) -> None:
@@ -355,6 +487,14 @@ def handle_update(token: str, upd: dict) -> None:
         reply(HELP_TEXT if text == "/help" else WELCOME_TEXT)
     elif text == "/topics":
         handle_topics(chat_id, reply)
+    elif text == "/status":
+        handle_status(chat_id, reply)
+    elif text.startswith("/schedule"):
+        handle_schedule(chat_id, text[len("/schedule"):], reply)
+    elif text == "/pause":
+        handle_pause(chat_id, reply)
+    elif text == "/resume":
+        handle_resume(chat_id, reply)
     elif text in ("/report", "/reportnow"):
         generate_report_now(chat_id, reply)
     elif text.startswith("/addtopic"):

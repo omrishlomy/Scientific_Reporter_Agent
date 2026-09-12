@@ -15,7 +15,7 @@ import json
 import os
 import pathlib
 import shutil
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 HERE = pathlib.Path(__file__).parent
 
@@ -79,6 +79,101 @@ def list_chat_ids() -> list[str]:
     if not CHATS_DIR.exists():
         return []
     return sorted(p.name for p in CHATS_DIR.iterdir() if p.is_dir() and (p / "topics.yaml").exists())
+
+
+# --- per-chat schedule + delivery state ---------------------------------------------
+# Kept in meta.json rather than topics.yaml on purpose: topics.yaml is hand-editable and
+# comment-preserving, this is machine-written bookkeeping. Mixing them would mean the bot
+# rewriting a documented file every time it sends a report.
+
+DEFAULT_INTERVAL_DAYS = 7
+DEFAULT_HOUR = 8
+MIN_INTERVAL_DAYS = 1
+MAX_INTERVAL_DAYS = 90
+
+
+def load_meta(chat_id: str) -> dict:
+    p = meta_path(chat_id)
+    if p.exists():
+        try:
+            return json.loads(p.read_text(encoding="utf-8"))
+        except json.JSONDecodeError:
+            # Corrupt metadata must not take a chat out of service permanently.
+            pass
+    return {}
+
+
+def save_meta(chat_id: str, meta: dict) -> None:
+    meta_path(chat_id).parent.mkdir(parents=True, exist_ok=True)
+    meta_path(chat_id).write_text(json.dumps(meta, indent=2), encoding="utf-8")
+
+
+def update_meta(chat_id: str, **fields) -> dict:
+    meta = load_meta(chat_id)
+    meta.update(fields)
+    save_meta(chat_id, meta)
+    return meta
+
+
+def get_interval_days(chat_id: str) -> int:
+    try:
+        v = int(load_meta(chat_id).get("interval_days", DEFAULT_INTERVAL_DAYS))
+    except (TypeError, ValueError):
+        return DEFAULT_INTERVAL_DAYS
+    return max(MIN_INTERVAL_DAYS, min(MAX_INTERVAL_DAYS, v))
+
+
+def get_hour(chat_id: str) -> int:
+    try:
+        v = int(load_meta(chat_id).get("hour", DEFAULT_HOUR))
+    except (TypeError, ValueError):
+        return DEFAULT_HOUR
+    return v if 0 <= v <= 23 else DEFAULT_HOUR
+
+
+def is_paused(chat_id: str) -> bool:
+    return bool(load_meta(chat_id).get("paused", False))
+
+
+def last_report_at(chat_id: str) -> datetime | None:
+    raw = load_meta(chat_id).get("last_report_at")
+    if not raw:
+        return None
+    try:
+        return datetime.fromisoformat(raw)
+    except ValueError:
+        return None
+
+
+def mark_report_started(chat_id: str) -> None:
+    """Stamped when a run BEGINS, not when it finishes. If a run crashes halfway, the
+    chat waits for its next interval instead of retrying on every scheduler tick --
+    a crash loop that re-ran an expensive pipeline forever would be far worse than
+    missing one digest."""
+    update_meta(chat_id, last_report_at=datetime.now(timezone.utc).isoformat())
+
+
+def next_due_at(chat_id: str) -> datetime:
+    """When this chat's next scheduled digest is due (UTC)."""
+    last = last_report_at(chat_id)
+    if last is None:
+        return datetime.now(timezone.utc)   # never sent -> due now
+    if last.tzinfo is None:
+        last = last.replace(tzinfo=timezone.utc)
+    return last + timedelta(days=get_interval_days(chat_id))
+
+
+def is_due(chat_id: str, now: datetime | None = None) -> bool:
+    if is_paused(chat_id):
+        return False
+    # Never reported: due immediately. Checked explicitly rather than via next_due_at,
+    # which returns "now" for this case -- and its now() is evaluated microseconds after
+    # the caller's, so `now >= next_due_at()` came out False and a brand new chat waited
+    # a whole tick for its first report.
+    if last_report_at(chat_id) is None:
+        return True
+    now = now or datetime.now(timezone.utc)
+    return now >= next_due_at(chat_id)
 
 
 def seed_from_bundle() -> int:
