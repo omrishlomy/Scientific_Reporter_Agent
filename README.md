@@ -123,6 +123,17 @@ migration.
 - **Telegram only retains pending updates for ~24 hours.** If the bot is broken or
   paused for longer than that, messages sent in the meantime are dropped by Telegram
   and can never be recovered -- you just send a new one.
+- **In GROUP chats, the bot cannot see plain text by default.** Telegram bots ship with
+  privacy mode ON, which means inside a group a bot only receives messages that are
+  commands (`/topics`, `/addtopic ...`) or direct replies to its own messages -- ordinary
+  chatter is never delivered to it. Consequences for this bot:
+  - In a group, plain-English topic descriptions will be silently ignored; use the
+    `/addtopic <name> | <query>` command form instead.
+  - To allow plain text in groups, message `@BotFather` -> `/setprivacy` -> pick this
+    bot -> **Disable**. Note this means the bot then receives *every* message in that
+    group, and each non-command message would be treated as a topic description -- so
+    leaving privacy ON is usually the better choice for a busy group.
+  - One-to-one chats are unaffected: the bot sees everything you send it.
 - **Plain-English topic drafting can misfire** -- it's one Groq call with no human
   review before the topic is saved. If a drafted query looks wrong, `/removetopic
   <name>` and try again with different wording, or use `/addtopic <name> | <query>`
