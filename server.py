@@ -46,7 +46,13 @@ TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")
 # Without checking it, the endpoint is a public URL that anyone could POST fake updates
 # to -- which here would mean adding topics or triggering report generation at will.
 WEBHOOK_SECRET = os.environ.get("TELEGRAM_WEBHOOK_SECRET", "")
-PUBLIC_URL = os.environ.get("PUBLIC_URL", "")   # e.g. https://<service>.up.railway.app
+# e.g. https://<service>.up.railway.app. Falls back to RAILWAY_PUBLIC_DOMAIN, which
+# Railway injects automatically once the service has a generated domain -- the first
+# real deploy failed with "PUBLIC_URL missing" and the bot silently received nothing, so
+# don't depend on a variable that has to be hand-copied from the same dashboard.
+PUBLIC_URL = os.environ.get("PUBLIC_URL", "").strip() or (
+    f"https://{os.environ['RAILWAY_PUBLIC_DOMAIN'].strip()}"
+    if os.environ.get("RAILWAY_PUBLIC_DOMAIN", "").strip() else "")
 TIMEZONE = os.environ.get("TIMEZONE", "Asia/Jerusalem")
 
 app = FastAPI(title="Scientific Reporter")
@@ -87,8 +93,10 @@ def register_webhook() -> None:
         log.error("TELEGRAM_BOT_TOKEN missing; webhook NOT registered")
         return
     if not PUBLIC_URL:
-        log.error("PUBLIC_URL missing; webhook NOT registered")
+        log.error("PUBLIC_URL missing and RAILWAY_PUBLIC_DOMAIN not set -- generate a "
+                  "domain under Settings > Networking; webhook NOT registered")
         return
+    log.info("public URL: %s", PUBLIC_URL)
     if not PUBLIC_URL.startswith("https://"):
         # Telegram only delivers webhooks over HTTPS; a bare domain is a common slip.
         log.error("PUBLIC_URL must start with https:// (got %r); webhook NOT registered", PUBLIC_URL)
