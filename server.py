@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import logging
 import os
+import re
 import sys
 import time
 from datetime import date, datetime, timezone
@@ -82,9 +83,23 @@ def scheduler_tick() -> None:
 
 
 def register_webhook() -> None:
-    if not (TOKEN and PUBLIC_URL):
-        log.warning("PUBLIC_URL or TELEGRAM_BOT_TOKEN missing; webhook NOT registered")
+    if not TOKEN:
+        log.error("TELEGRAM_BOT_TOKEN missing; webhook NOT registered")
         return
+    if not PUBLIC_URL:
+        log.error("PUBLIC_URL missing; webhook NOT registered")
+        return
+    if not PUBLIC_URL.startswith("https://"):
+        # Telegram only delivers webhooks over HTTPS; a bare domain is a common slip.
+        log.error("PUBLIC_URL must start with https:// (got %r); webhook NOT registered", PUBLIC_URL)
+        return
+    if WEBHOOK_SECRET and not re.fullmatch(r"[A-Za-z0-9_-]{1,256}", WEBHOOK_SECRET):
+        # Telegram rejects the whole setWebhook call if the secret has any other
+        # character, and the bot then silently receives nothing.
+        log.error("TELEGRAM_WEBHOOK_SECRET may only contain A-Z a-z 0-9 _ - "
+                  "(1-256 chars); webhook NOT registered -- change the variable")
+        return
+
     url = f"{PUBLIC_URL.rstrip('/')}/telegram/webhook"
     payload = {"url": url, "drop_pending_updates": False,
                "allowed_updates": '["message","callback_query"]'}
@@ -94,6 +109,13 @@ def register_webhook() -> None:
         r = requests.post(f"https://api.telegram.org/bot{TOKEN}/setWebhook",
                           data=payload, timeout=30)
         log.info("setWebhook -> %s %s", r.status_code, r.text[:300])
+        # Ask Telegram what it actually has on file. last_error_message is the only
+        # place delivery failures (bad cert, 403, timeouts) ever show up.
+        info = requests.get(f"https://api.telegram.org/bot{TOKEN}/getWebhookInfo",
+                            timeout=30).json().get("result", {})
+        log.info("webhook info: url=%s pending=%s last_error=%s",
+                 info.get("url"), info.get("pending_update_count"),
+                 info.get("last_error_message"))
     except requests.RequestException:
         log.exception("setWebhook failed")
 
