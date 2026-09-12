@@ -1,28 +1,54 @@
+# This chat's topics -- managed via Telegram (/addtopic, /removetopic, /topics, or
+# just describe a topic in plain English), or edit by hand here, same effect either way.
+#
+# TO ADD A TOPIC:    copy a block, change name + query.
+# TO REMOVE:         delete the block, or just set  enabled: false
+# Changes take effect on the next run. Nothing to restart.
+#
+# Query syntax is Europe PMC's. The useful bits:
+#   TITLE:"x"  ABSTRACT:"x"  AUTH:"Name"   quotes force a phrase
+#   AND OR NOT   ( )                        grouping
+#   *                                       wildcard: anaesthe* matches -sia/-tic
+# Europe PMC covers PubMed *and* bioRxiv/medRxiv preprints, so preprints show up too.
+
 settings:
-  lookback_days: 7
-  max_per_topic: 8
-  preprints: true
+  lookback_days: 7        # how far back each weekly run looks
+  max_per_topic: 8        # cap per topic, keeps the digest readable
+  preprints: true         # include bioRxiv / medRxiv preprints
+
 topics:
-- name: Respiration and the brain
-  enabled: true
-  query: "(TITLE:\"respiration\" OR TITLE:\"breathing\" OR TITLE:\"respiratory\"\n OR ABSTRACT:\"respiratory\
-    \ rhythm\" OR ABSTRACT:\"breathing rhythm\")\nAND (TITLE:brain OR TITLE:neural OR TITLE:cortical OR\
-    \ TITLE:oscillat*\n     OR ABSTRACT:\"neural oscillation\" OR ABSTRACT:EEG)\n"
-- name: Disorders of Consciousness
-  enabled: true
-  query: "(TITLE:\"disorders of consciousness\" OR TITLE:\"vegetative state\"\n OR TITLE:\"minimally conscious\"\
-    \ OR TITLE:\"unresponsive wakefulness\"\n OR ABSTRACT:\"disorders of consciousness\" OR TITLE:\"covert\
-    \ consciousness\")\n"
-- name: Psychedelics
-  enabled: true
-  query: "(TITLE:psychedelic* OR TITLE:psilocybin OR TITLE:LSD OR TITLE:ayahuasca\n OR TITLE:DMT OR TITLE:ketamine\
-    \ OR TITLE:MDMA)\nAND (TITLE:brain OR TITLE:neural OR TITLE:consciousness OR TITLE:EEG\n     OR TITLE:clinical\
-    \ OR TITLE:trial OR ABSTRACT:neuroimaging)\n"
-- name: Neurofeedback
-  enabled: true
-  query: "(TITLE:neurofeedback OR ABSTRACT:neurofeedback\n OR TITLE:\"brain-computer interface\" OR TITLE:\"\
-    brain computer interface\"\n OR ABSTRACT:\"real-time fMRI neurofeedback\"\n OR (TITLE:\"closed-loop\"\
-    \ AND (ABSTRACT:EEG OR ABSTRACT:cortical\n                              OR ABSTRACT:neural OR ABSTRACT:brain)))\n"
-- name: General query
-  enabled: true
-  query: TITLE:*
+
+  - name: Respiration and the brain
+    enabled: true
+    query: >
+      (TITLE:"respiration" OR TITLE:"breathing" OR TITLE:"respiratory"
+       OR ABSTRACT:"respiratory rhythm" OR ABSTRACT:"breathing rhythm")
+      AND (TITLE:brain OR TITLE:neural OR TITLE:cortical OR TITLE:oscillat*
+           OR ABSTRACT:"neural oscillation" OR ABSTRACT:EEG)
+
+  - name: Disorders of Consciousness
+    enabled: true
+    query: >
+      (TITLE:"disorders of consciousness" OR TITLE:"vegetative state"
+       OR TITLE:"minimally conscious" OR TITLE:"unresponsive wakefulness"
+       OR ABSTRACT:"disorders of consciousness" OR TITLE:"covert consciousness")
+
+  - name: Psychedelics
+    enabled: true
+    query: >
+      (TITLE:psychedelic* OR TITLE:psilocybin OR TITLE:LSD OR TITLE:ayahuasca
+       OR TITLE:DMT OR TITLE:ketamine OR TITLE:MDMA)
+      AND (TITLE:brain OR TITLE:neural OR TITLE:consciousness OR TITLE:EEG
+           OR TITLE:clinical OR TITLE:trial OR ABSTRACT:neuroimaging)
+
+  - name: Neurofeedback
+    enabled: true
+    # NOTE: "closed-loop" MUST stay parenthesised with its neural qualifier. Without the
+    # inner brackets, AND binds tighter than OR and the bare term escapes -- the first
+    # run pulled in gallium recycling and lithium-battery papers.
+    query: >
+      (TITLE:neurofeedback OR ABSTRACT:neurofeedback
+       OR TITLE:"brain-computer interface" OR TITLE:"brain computer interface"
+       OR ABSTRACT:"real-time fMRI neurofeedback"
+       OR (TITLE:"closed-loop" AND (ABSTRACT:EEG OR ABSTRACT:cortical
+                                    OR ABSTRACT:neural OR ABSTRACT:brain)))

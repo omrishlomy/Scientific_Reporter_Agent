@@ -29,7 +29,7 @@ concurrency:
 jobs:
   poll:
     runs-on: ubuntu-latest
-    timeout-minutes: 5
+    timeout-minutes: 15   # an on-demand report runs the full pipeline inline
     steps:
       - uses: actions/checkout@v4
 
@@ -38,7 +38,9 @@ jobs:
           python-version: '3.12'
 
       - name: Install Python dependencies
-        run: pip install pyyaml requests
+        # Full requirements: the poller can now generate a report on demand
+        # (the button / /report), which needs matplotlib for the infographic.
+        run: pip install -r requirements.txt
 
       - name: Poll for commands
         env:
