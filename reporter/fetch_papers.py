@@ -94,17 +94,40 @@ def format_paper(p: dict) -> str:
         lines.append("")
     lines += [f"*{authors}*", "", f"{meta}  \n<{link}>", ""]
 
-    abstract = (p.get("abstractText") or "").strip()
-    if abstract:
-        # Europe PMC sometimes embeds light HTML in abstracts.
-        for tag in ("<p>", "</p>", "<i>", "</i>", "<b>", "</b>", "<sub>", "</sub>",
-                    "<sup>", "</sup>", "<h4>", "</h4>"):
-            abstract = abstract.replace(tag, " ")
-        lines += [" ".join(abstract.split()), ""]
-    else:
-        lines += ["_No abstract available._", ""]
+    abstract = clean_abstract(p)
+    lines += [abstract, ""] if abstract else ["_No abstract available._", ""]
 
     return "\n".join(lines)
+
+
+def clean_abstract(p: dict) -> str:
+    abstract = (p.get("abstractText") or "").strip()
+    # Europe PMC sometimes embeds light HTML in abstracts.
+    for tag in ("<p>", "</p>", "<i>", "</i>", "<b>", "</b>", "<sub>", "</sub>",
+                "<sup>", "</sup>", "<h4>", "</h4>"):
+        abstract = abstract.replace(tag, " ")
+    return " ".join(abstract.split())
+
+
+def paper_record(p: dict, backfilled: bool) -> dict:
+    """Everything the NotebookLM document needs, including what the markdown digest
+    drops: pmcid + open-access flag (to fetch full text) and whether it's an earlier paper."""
+    doi = (p.get("doi") or "").strip()
+    source = p.get("source") or "MED"
+    return {
+        "title": (p.get("title") or "Untitled").strip().rstrip("."),
+        "authors": (p.get("authorString") or "").strip(),
+        "journal": (p.get("journalTitle") or "").strip(),
+        "date": (p.get("firstPublicationDate") or p.get("pubYear") or "").strip(),
+        "doi": doi,
+        "pmid": p.get("pmid") or "",
+        "pmcid": p.get("pmcid") or "",
+        "open_access": (p.get("isOpenAccess") or "") == "Y",
+        "preprint": source == "PPR",
+        "link": f"https://doi.org/{doi}" if doi else f"https://europepmc.org/article/{source}/{p.get('id', '')}",
+        "abstract": clean_abstract(p),
+        "backfilled": backfilled,
+    }
 
 
 def unique_path(directory: pathlib.Path, stem: str, ext: str) -> pathlib.Path:
@@ -257,6 +280,7 @@ def main() -> int:
     total = 0
     per_topic_counts = []
     sources: list[tuple[str, dict]] = []   # (topic name, paper) for the sources file
+    records: list[dict] = []               # structured copy for the NotebookLM document
 
     for topic in cfg.get("topics", []):
         if not topic.get("enabled", True):
@@ -287,6 +311,7 @@ def main() -> int:
         sources.extend((name, p) for p in papers)
 
         body += [f"## {name}", ""]
+        note = ""
         if not papers:
             body += [f"_No papers you haven't already been sent, even searching back {widest} "
                      "days. This topic may be too narrow._", ""]
@@ -294,10 +319,14 @@ def main() -> int:
             if backfilled:
                 lead = (f"No new papers in the last {days} days" if new_count == 0
                         else f"Only {new_count} new paper(s) in the last {days} days")
-                body += [f"_{lead} -- also including {backfilled} earlier paper(s) you haven't "
-                         f"been sent, from up to {widest} days back._", ""]
+                note = (f"{lead} -- also including {backfilled} earlier paper(s) you haven't "
+                        f"been sent, from up to {widest} days back.")
+                body += [f"_{note}_", ""]
             body += [format_paper(p) for p in papers]
         body += ["---", ""]
+        if papers:
+            records.append({"name": name, "note": note,
+                            "papers": [paper_record(p, i >= new_count) for i, p in enumerate(papers)]})
 
     fresh = {uid(p) for _, p in sources}
     summary = ", ".join(f"{n}: {c}" + (f" (+{b} earlier)" if b else "")
@@ -319,10 +348,17 @@ def main() -> int:
     srcfile = unique_path(args.out, f"sources-{today.isoformat()}", ".md")
     srcfile.write_text(build_sources(sources, today), encoding="utf-8")
 
+    jsonfile = unique_path(args.out, f"papers-{today.isoformat()}", ".json")
+    jsonfile.write_text(json.dumps({"date": today.isoformat(), "lookback_days": days,
+                                    "topics": records}, ensure_ascii=False, indent=2),
+                        encoding="utf-8")
+
     save_seen(seen | fresh, args.seen_file)
 
     # stdout is consumed by the caller (run_reporter_cloud.py / run-reporter.ps1).
-    print(f"{total}|{outfile}|{srcfile}")
+    # The 4th field was added later; readers that split on "|" into three keep working
+    # only if they use maxsplit, so run_reporter_cloud accepts both forms.
+    print(f"{total}|{outfile}|{srcfile}|{jsonfile}")
     return 0
 
 

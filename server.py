@@ -25,7 +25,7 @@ import os
 import re
 import sys
 import time
-from datetime import date, datetime, timezone
+from datetime import datetime, timezone
 from pathlib import Path
 
 import requests
@@ -36,7 +36,6 @@ sys.path.insert(0, str(Path(__file__).parent / "reporter"))
 
 import bot_poll          # noqa: E402
 import chats_store       # noqa: E402
-import run_reporter_cloud  # noqa: E402
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger("reporter")
@@ -70,17 +69,29 @@ app = FastAPI(title="Scientific Reporter")
 scheduler = BackgroundScheduler(timezone=TIMEZONE)
 
 
+TICK_MINUTES = 10
+
+
 def scheduler_tick() -> None:
-    """Runs hourly and sends to whichever chats are due.
+    """Runs every TICK_MINUTES and sends to whichever chats have a passed, unsent slot.
 
     Deliberately a due-check rather than one cron per chat: each chat sets its own
-    interval (/schedule), so cron jobs would have to be added/removed as users change
-    settings, and a fire missed during a restart or redeploy would simply be lost.
-    A tick that asks "is this chat overdue?" self-heals -- a chat that was due while the
-    service was down goes out on the next tick instead of waiting a full interval."""
+    schedule (/schedule), so cron jobs would have to be added/removed as users change
+    settings, and a fire missed during a restart or redeploy would simply be lost. A
+    tick that asks "has a slot passed without a report?" self-heals."""
     now = datetime.now(timezone.utc)
-    today = date.today().isoformat()
-    due = [c for c in chats_store.list_chat_ids() if chats_store.is_due(c, now)]
+    chats = chats_store.list_chat_ids()
+    due = [c for c in chats if chats_store.is_due(c, now)]
+
+    # Hourly heartbeat, so the logs prove the scheduler is alive between reports. A
+    # missed Monday report is otherwise indistinguishable from a service that was asleep
+    # (Railway's Serverless mode) or a scheduler that stopped.
+    if now.minute < TICK_MINUTES:
+        upcoming = ", ".join(
+            f"{c}: {'paused' if chats_store.is_paused(c) else chats_store.format_local(chats_store.next_due_at(c, now))}"
+            for c in chats) or "no chats"
+        log.info("heartbeat: %d chat(s), %d due now; next -> %s", len(chats), len(due), upcoming)
+
     if not due:
         return
     log.info("tick: %d chat(s) due", len(due))
@@ -154,12 +165,16 @@ def on_startup() -> None:
 
     register_webhook()
 
-    scheduler.add_job(scheduler_tick, "interval", hours=1, id="digest_tick",
+    scheduler.add_job(scheduler_tick, "interval", minutes=TICK_MINUTES, id="digest_tick",
                       replace_existing=True, misfire_grace_time=3600,
                       coalesce=True, max_instances=1)
     scheduler.start()
-    log.info("digest tick scheduled hourly; per-chat intervals default to %d days",
-             chats_store.DEFAULT_INTERVAL_DAYS)
+    log.info("scheduler checks every %d min; default schedule is every Monday 08:00 (%s)",
+             TICK_MINUTES, chats_store.LOCAL_TZ)
+    for c in chats_store.list_chat_ids():
+        log.info("chat %s: %s; next report %s%s", c, chats_store.describe_schedule(c),
+                 chats_store.format_local(chats_store.next_due_at(c)),
+                 " (paused)" if chats_store.is_paused(c) else "")
 
 
 @app.on_event("shutdown")
@@ -175,8 +190,8 @@ def root():
         "service": "Scientific Reporter",
         "chats": len(chats),
         "paused": sum(1 for c in chats if chats_store.is_paused(c)),
-        "tick": "hourly; each chat has its own interval (default "
-                f"{chats_store.DEFAULT_INTERVAL_DAYS} days)",
+        "schedule": f"checked every {TICK_MINUTES} min; default every Monday 08:00 "
+                    f"({chats_store.LOCAL_TZ})",
     }
 
 

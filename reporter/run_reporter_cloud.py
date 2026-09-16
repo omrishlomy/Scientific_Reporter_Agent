@@ -74,6 +74,67 @@ INFOGRAPHIC_SCHEMA = {
 }
 
 
+# One call per topic produces both the infographic card and the NotebookLM notes, so the
+# richer document doesn't double the Groq calls against the free tier's daily budget.
+TOPIC_NOTES_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "gist": {"type": "string"},
+        "background": {"type": "string"},
+        "connections": {"type": "string"},
+        "papers": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "properties": {
+                    "index": {"type": "integer"},
+                    "short_title": {"type": "string"},
+                    "finding": {"type": "string"},
+                    "question": {"type": "string"},
+                    "approach": {"type": "string"},
+                    "key_results": {"type": "string"},
+                    "why_it_matters": {"type": "string"},
+                    "limitations": {"type": "string"},
+                },
+                "required": ["index", "short_title", "finding", "question", "approach",
+                             "key_results", "why_it_matters", "limitations"],
+                "additionalProperties": False,
+            },
+        },
+        "glossary": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "properties": {"term": {"type": "string"}, "definition": {"type": "string"}},
+                "required": ["term", "definition"],
+                "additionalProperties": False,
+            },
+        },
+    },
+    "required": ["gist", "background", "connections", "papers", "glossary"],
+    "additionalProperties": False,
+}
+
+NOTES_MAX_TOKENS = 3200
+
+
+def safe_filename(name: str, max_len: int = 150) -> str:
+    name = re.sub(r'[<>:"/\\|?*\x00-\x1f]', "", name)
+    name = " ".join(name.split()).rstrip(". ")
+    return name[:max_len].rstrip(". ")
+
+
+def topics_label(names: list[str], limit: int = 60) -> str:
+    """'Respiration and the brain, Psychedelics +2 more' -- short enough for a file name."""
+    shown: list[str] = []
+    for n in names:
+        if shown and len(", ".join(shown + [n])) > limit:
+            break
+        shown.append(n)
+    rest = len(names) - len(shown)
+    return ", ".join(shown) + (f" +{rest} more" if rest else "")
+
+
 def log(chat_id: str, msg: str) -> None:
     print(f"[run_reporter_cloud][{chat_id}] {msg}", file=sys.stderr)
 
@@ -117,9 +178,11 @@ def process_chat(chat_id: str, today: str) -> None:
     if not line:
         log(chat_id, f"unexpected fetch_papers.py output: {r.stdout!r}")
         return
-    count_str, digest_path, sources_path = line.split("|", 2)
+    parts = line.split("|")
+    count_str, digest_path, sources_path = parts[:3]
+    papers_json_path = parts[3] if len(parts) > 3 else None
     count = int(count_str)
-    log(chat_id, f"{count} new paper(s) -> {digest_path}")
+    log(chat_id, f"{count} paper(s) -> {digest_path}")
 
     if count == 0:
         # Only reachable now if a topic matches nothing unseen even several years back
@@ -137,11 +200,34 @@ def process_chat(chat_id: str, today: str) -> None:
     # The LLM calls get a COMPACT view of the digest, never the raw file. A normal week is
     # ~13K tokens; Groq's free tier caps a request at 8K tokens/minute, so the raw digest
     # was rejected outright and both the brief and the infographic silently disappeared.
-    # The full digest still goes to the user for NotebookLM.
-    from local_llm import run_prompt   # imported here so --help works without GROQ_API_KEY set
+    from local_llm import run_prompt, estimate_tokens, budget
     import digest_compact
+    import notebooklm_doc
 
     topics = digest_compact.parse_digest(digest_text)
+
+    # Structured paper records (pmcid, open-access flag, earlier-paper flag) for the
+    # NotebookLM document. Fall back to what the markdown digest carries if absent.
+    if papers_json_path and pathlib.Path(papers_json_path).exists():
+        harvest = json.loads(pathlib.Path(papers_json_path).read_text(encoding="utf-8"))
+        records, lookback = harvest.get("topics") or [], int(harvest.get("lookback_days") or 7)
+    else:
+        records, lookback = [{"name": t["name"], "note": t.get("note", ""), "papers": [
+            {"title": p["title"], "abstract": p["abstract"], "preprint": p["preprint"],
+             "link": "", "backfilled": False} for p in t["papers"]]} for t in topics], 7
+
+    # --- informative file names ---------------------------------------------------
+    label = topics_label([t["name"] for t in topics])
+    def named(kind: str, ext: str) -> pathlib.Path:
+        return unique_path(out_dir, safe_filename(f"{today} {kind} - {label}"), ext)
+
+    for old, kind in ((digest_path, "Paper list with links"), (sources_path, "Sources")):
+        new = named(kind, ".md")
+        pathlib.Path(old).rename(new)
+        if old == digest_path:
+            digest_path = str(new)
+        else:
+            sources_path = str(new)
 
     # --- 2. synthesis -----------------------------------------------------------
     synthesis_prompt = (HERE / "synthesis-prompt.md").read_text(encoding="utf-8")
@@ -154,31 +240,64 @@ def process_chat(chat_id: str, today: str) -> None:
         log(chat_id, f"synthesis failed: {e}; continuing without a brief")
         brief_prose = ""
 
-    # --- 3. infographic data: one call per topic ---------------------------------
-    # Per topic keeps each request small, and means one bad topic costs one card rather
-    # than the whole infographic. Counts and names come from the digest itself, not the
-    # model, so a card can never disagree with the digest it summarises.
+    # --- 3. per-topic notes + infographic cards -------------------------------------
+    # One call per topic returns both the NotebookLM notes and the card. Per topic keeps
+    # each request under the per-minute budget, and one bad topic costs one topic rather
+    # than the whole report. Names and counts come from the digest, not the model.
+    notes_prompt = (HERE / "topic-notes-prompt.md").read_text(encoding="utf-8")
     infographic_prompt = (HERE / "infographic-prompt.md").read_text(encoding="utf-8")
-    cards = []
+    records_by_name = {rec["name"]: rec for rec in records}
+    cards, notes, notes_failed = [], {}, []
     for t in topics:
-        try:
-            raw = run_prompt(infographic_prompt, digest_compact.compact([t], abstract_chars=700),
-                             max_tokens=1500, json_schema=INFOGRAPHIC_SCHEMA,
-                             reasoning_effort="low")
-            raw = re.sub(r"```\s*$", "", re.sub(r"^```(json)?\s*", "", raw.strip()))
-            items = json.loads(raw).get("topics") or []
-            if items:
-                card = items[0]
-                card["name"], card["count"] = t["name"], t["count"]
-                cards.append(card)
-        except Exception as e:
-            log(chat_id, f"infographic data failed for topic {t['name']!r}: {e}")
+        rec = records_by_name.get(t["name"])
+        card = None
+        if rec:
+            try:
+                # Shrink abstracts until the request fits, rather than failing a topic
+                # that happens to have long titles or many papers.
+                user = None
+                for chars in (650, 500, 350, 220):
+                    candidate = notebooklm_doc.numbered_topic_input(rec, chars)
+                    if estimate_tokens(notes_prompt, candidate) + NOTES_MAX_TOKENS <= budget():
+                        user = candidate
+                        break
+                if user is None:
+                    raise RuntimeError("topic too large for one request even with short abstracts")
+                raw = run_prompt(notes_prompt, user, max_tokens=NOTES_MAX_TOKENS,
+                                 json_schema=TOPIC_NOTES_SCHEMA, reasoning_effort="low")
+                data = json.loads(re.sub(r"```\s*$", "", re.sub(r"^```(json)?\s*", "", raw.strip())))
+                if not isinstance(data.get("papers"), list):
+                    raise RuntimeError("notes response missing papers")
+                notes[t["name"]] = data
+                ordered = sorted((e for e in data["papers"] if isinstance(e, dict)),
+                                 key=lambda e: e.get("index", 0))
+                card = {"name": t["name"], "count": t["count"], "gist": data.get("gist", ""),
+                        "papers": [{"title": e.get("short_title", ""), "finding": e.get("finding", "")}
+                                   for e in ordered]}
+            except Exception as e:
+                log(chat_id, f"topic notes failed for {t['name']!r}: {e}")
+                notes_failed.append(t["name"])
+        if card is None:
+            # Cheaper card-only call, so a notes failure doesn't also cost the infographic.
+            try:
+                raw = run_prompt(infographic_prompt, digest_compact.compact([t], abstract_chars=700),
+                                 max_tokens=1500, json_schema=INFOGRAPHIC_SCHEMA,
+                                 reasoning_effort="low")
+                raw = re.sub(r"```\s*$", "", re.sub(r"^```(json)?\s*", "", raw.strip()))
+                items = json.loads(raw).get("topics") or []
+                if items:
+                    card = items[0]
+                    card["name"], card["count"] = t["name"], t["count"]
+            except Exception as e:
+                log(chat_id, f"infographic data failed for topic {t['name']!r}: {e}")
+        if card:
+            cards.append(card)
     json_block = json.dumps({"topics": cards}, ensure_ascii=False, indent=2) if cards else None
 
     # --- write the brief file ----------------------------------------------------
-    brief_path = unique_path(out_dir, f"brief-{today}", ".md")
-    header = (f"# Weekly brief - {today}\n\n"
-              f"Synthesis of {count} new paper(s). Sources: {pathlib.Path(sources_path).name}\n\n---\n\n")
+    brief_path = named("Written brief", ".md")
+    header = (f"# Written brief - {today}\n\n"
+              f"Synthesis of {count} paper(s). Sources: {pathlib.Path(sources_path).name}\n\n---\n\n")
     body = brief_prose
     if json_block:
         body += f"\n\n```json\n{json_block}\n```"
@@ -188,7 +307,7 @@ def process_chat(chat_id: str, today: str) -> None:
     # --- 4. infographic -----------------------------------------------------------
     infographic_path = None
     if json_block:
-        infographic_path = unique_path(out_dir, f"infographic-{today}", ".png")
+        infographic_path = named("Infographic", ".png")
         r = sh([sys.executable, str(HERE / "make_infographic.py"),
                 "--brief", str(brief_path), "--out", str(infographic_path), "--date", today])
         if r.returncode == 0 and infographic_path.exists():
@@ -197,10 +316,24 @@ def process_chat(chat_id: str, today: str) -> None:
             log(chat_id, f"infographic not generated: {r.stdout} {r.stderr}")
             infographic_path = None
 
-    # --- 5. notify ------------------------------------------------------------
+    # --- 5. NotebookLM source document ------------------------------------------------
+    full_texts: dict[str, list] = {}
+    for rec in records:
+        for p in rec["papers"]:
+            if p.get("link"):
+                sections = notebooklm_doc.fetch_full_text(p)
+                if sections:
+                    full_texts[p["link"]] = sections
+    notebooklm_path = named("NotebookLM source", ".md")
+    notebooklm_path.write_text(
+        notebooklm_doc.build_document(today, label, records, brief_prose, notes, full_texts, lookback),
+        encoding="utf-8")
+    log(chat_id, f"notebooklm -> {notebooklm_path} ({len(full_texts)} full text(s))")
+
+    # --- 6. notify ------------------------------------------------------------
     # Not "new": thin topics are topped up with earlier unseen papers, and the digest
     # and brief say which ones those are.
-    subject = f"Paper digest - {count} paper(s)"
+    subject = f"Research report - {count} paper(s) - {label}"
     tg_message = subject
     if brief_prose:
         preview = brief_prose[:3300] + "..." if len(brief_prose) > 3300 else brief_prose
@@ -216,12 +349,17 @@ def process_chat(chat_id: str, today: str) -> None:
         missing.append("the infographic")
     elif len(cards) < len(topics):
         missing.append(f"infographic cards for {len(topics) - len(cards)} topic(s)")
+    if notes_failed:
+        missing.append(f"plain-language notes for {len(notes_failed)} topic(s)")
     if missing:
         tg_message += ("\n\n(Couldn't generate " + " and ".join(missing) +
-                       " this time -- the full digest file below is complete.)")
+                       " this time -- the paper list and abstracts are complete.)")
 
     tg_cmd = [sys.executable, str(HERE / "telegram_notify.py"), "--chat-id", chat_id,
-              "--message", tg_message, "--document", digest_path]
+              "--message", tg_message,
+              "--document", str(notebooklm_path),
+              "For NotebookLM: add this file as a source, then choose Audio Overview.",
+              "--document", digest_path, "All papers with abstracts and links."]
     if infographic_path:
         tg_cmd += ["--photo", str(infographic_path)]
     r = sh(tg_cmd)

@@ -1,15 +1,11 @@
 """
-Telegram sender for the cloud (GitHub Actions) path -- a Python port of
-send-telegram.ps1, since Actions runners are Linux and the PowerShell version's
-credential storage (DPAPI) is Windows-only anyway. Reads the bot token from an
-environment variable (a GitHub Actions secret), not a local encrypted file, since
-there is no persistent "this machine" to scope DPAPI to on an ephemeral runner.
+Telegram sender used by the report pipeline.
 
-    python telegram_notify.py --chat-id 123456 --message "text" [--photo path.png] [--document path.md]
+    python telegram_notify.py --chat-id 123456 --message "text" [--photo path.png]
+        [--document path.md ["caption"]] [--document other.md ["caption"]] ...
 
---chat-id is required in multi-tenant mode (one send per registered chat). Falls back
-to the TELEGRAM_CHAT_ID env var if --chat-id is omitted, for any single-chat/local
-testing use.
+Sends the message, then the photo, then each document in order. --chat-id falls back to
+the TELEGRAM_CHAT_ID env var for single-chat/local testing.
 
 Exits 0 on success, 1 on failure, 2 if TELEGRAM_BOT_TOKEN or a chat id are unset
 (so a missing secret degrades the run to "no notification" rather than failing it).
@@ -22,12 +18,15 @@ import sys
 
 import requests
 
+CAPTION_LIMIT = 1024   # Telegram's limit for photo/document captions
+
 
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--message", required=True)
     ap.add_argument("--photo")
-    ap.add_argument("--document")
+    ap.add_argument("--document", action="append", nargs="+", default=[],
+                    metavar=("PATH", "CAPTION"), help="repeatable; optional caption after the path")
     ap.add_argument("--chat-id", help="defaults to TELEGRAM_CHAT_ID env var if omitted")
     args = ap.parse_args()
 
@@ -48,13 +47,21 @@ def main() -> int:
         if args.photo and os.path.exists(args.photo):
             with open(args.photo, "rb") as f:
                 r = requests.post(f"{base}/sendPhoto", data={"chat_id": chat_id},
-                                   files={"photo": f}, timeout=60)
+                                  files={"photo": (os.path.basename(args.photo), f)}, timeout=60)
                 r.raise_for_status()
 
-        if args.document and os.path.exists(args.document):
-            with open(args.document, "rb") as f:
-                r = requests.post(f"{base}/sendDocument", data={"chat_id": chat_id},
-                                   files={"document": f}, timeout=60)
+        for entry in args.document:
+            path, caption = entry[0], " ".join(entry[1:]).strip()
+            if not os.path.exists(path):
+                print(f"WARN document not found, skipping: {path}", file=sys.stderr)
+                continue
+            data = {"chat_id": chat_id}
+            if caption:
+                data["caption"] = caption[:CAPTION_LIMIT]
+            with open(path, "rb") as f:
+                # Explicit filename: that's what the user sees and saves in Telegram.
+                r = requests.post(f"{base}/sendDocument", data=data,
+                                  files={"document": (os.path.basename(path), f)}, timeout=120)
                 r.raise_for_status()
 
         return 0

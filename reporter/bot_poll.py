@@ -84,37 +84,29 @@ TOPIC_DRAFT_SCHEMA = {
 }
 
 WELCOME_TEXT = (
-    "Hi, I'm your Scientific Reporter.\n\n"
-    "Every week I search newly published research (Europe PMC -- journals and "
-    "bioRxiv/medRxiv preprints) on the topics you pick, and send you:\n"
-    "  - a short written brief of what's new and how it connects\n"
-    "  - an infographic summary you can read in 10 seconds\n"
-    "  - the full digest file, to drop into NotebookLM for a deep dive\n\n"
-    "To set your topics, send them wrapped in asterisks:\n"
-    "*sleep and memory* *gut microbiome* *CRISPR gene therapy*\n\n"
-    "Add more any time the same way -- just send *your new topic*.\n\n"
-    "Reports go out automatically once a week -- send /schedule to make that daily, "
-    "monthly, or anything in between. Use the button below (or /report) for one right "
-    "now.\n\n"
-    "/status to see your setup  |  /help for everything else"
+    "Hi, I'm your research assistant. I'll send you reports on new research papers.\n\n"
+    "Tell me your topics like this:\n"
+    "*sleep and memory* *gut microbiome*\n\n"
+    "Reports come every Monday at 08:00. To change that:\n"
+    "/schedule daily  or  /schedule weekly thursday 18\n\n"
+    "/help for more"
 )
 
 HELP_TEXT = (
-    "How to use me:\n\n"
-    "ADD TOPICS -- send them wrapped in asterisks, as many at once as you like:\n"
-    "  *sleep and memory* *vagus nerve stimulation*\n"
-    "I'll build the search query for each one.\n\n"
-    "Commands:\n"
+    "Add topics (as many as you like):\n"
+    "  *sleep and memory* *vagus nerve stimulation*\n\n"
+    "Schedule:\n"
+    "  /schedule weekly monday 8   (the default)\n"
+    "  /schedule daily 18\n"
+    "  /schedule 2w friday\n"
+    "  /schedule monthly\n\n"
+    "Other commands:\n"
+    "/report - a report right now\n"
     "/topics - list your topics\n"
     "/removetopic <name> - turn a topic off\n"
-    "/report - generate a report right now\n"
-    "/schedule - how often reports arrive (default: every week)\n"
-    "    /schedule daily | weekly | 2w | 10d | monthly\n"
-    "/pause and /resume - stop/restart scheduled reports (topics are kept)\n"
-    "/status - topics, schedule, last and next report\n"
-    "/help - this message\n\n"
-    "Power user: /addtopic <name> | <exact Europe PMC query> skips the query drafting,\n"
-    "  e.g. /addtopic Vagus nerve | (TITLE:\"vagus nerve\" OR TITLE:VNS) AND TITLE:brain"
+    "/pause, /resume - stop or restart scheduled reports\n"
+    "/status - your topics and when the next report comes\n\n"
+    "Power user: /addtopic <name> | <exact Europe PMC query>"
 )
 
 # Inline keyboard attached to bot replies. callback_data is what comes back in the
@@ -298,33 +290,76 @@ def parse_interval(arg: str) -> int | None:
     return n
 
 
-def describe_interval(days: int) -> str:
-    return {1: "every day", 7: "every week", 14: "every 2 weeks",
-            30: "every month"}.get(days, f"every {days} days")
+WEEKDAY_TOKENS = {name: i for i, full in enumerate(chats_store.WEEKDAY_NAMES)
+                  for name in (full.lower(), full[:3].lower())}
+
+
+def parse_hour(token: str) -> int | None:
+    """'8', '08', '18:00', '8am', '6pm', '18h' -> hour 0-23."""
+    m = re.fullmatch(r"(\d{1,2})(?::00)?\s*(am|pm|h)?", token.strip().lower())
+    if not m:
+        return None
+    h, suffix = int(m.group(1)), m.group(2)
+    if suffix in ("am", "pm"):
+        if not 1 <= h <= 12:
+            return None
+        h = (h % 12) + (12 if suffix == "pm" else 0)
+    return h if 0 <= h <= 23 else None
+
+
+def parse_schedule(arg: str, current_interval: int) -> dict | None:
+    """'weekly', 'weekly thursday 18', 'daily 18:00', '2w friday', 'monday', '9am'.
+    Weekday and hour are optional and may come in any order after the interval; a
+    command with no interval keeps the current one. Returns the fields to change, or
+    None if part of it can't be understood."""
+    tokens = arg.lower().replace(",", " ").split()
+    changes: dict = {}
+    rest = []
+    for tok in tokens:
+        if tok in WEEKDAY_TOKENS:
+            changes["weekday"] = WEEKDAY_TOKENS[tok]
+        else:
+            rest.append(tok)
+    if not rest:
+        changes.setdefault("interval_days", current_interval)
+        return changes if "weekday" in changes else None
+
+    # Try the whole remainder as an interval first, so "10 days" isn't read as hour 10.
+    interval = parse_interval(" ".join(rest))
+    if interval is None:
+        hour = parse_hour(rest[-1])
+        if hour is None:
+            return None
+        changes["hour"] = hour
+        rest = rest[:-1]
+        interval = parse_interval(" ".join(rest)) if rest else current_interval
+        if interval is None:
+            return None
+    changes["interval_days"] = interval
+    return changes
 
 
 def handle_schedule(chat_id: str, arg: str, reply) -> None:
     if not arg.strip():
-        days = chats_store.get_interval_days(chat_id)
         nxt = chats_store.next_due_at(chat_id)
-        reply(f"Reports: {describe_interval(days)}.\n"
-              f"Next one due: {nxt:%Y-%m-%d %H:%M} UTC\n\n"
-              "Change it with /schedule <interval>, e.g.\n"
-              "  /schedule daily\n  /schedule 3d\n  /schedule 2w\n  /schedule monthly")
+        reply(f"Reports go out {chats_store.describe_schedule(chat_id)}.\n"
+              f"Next one: {chats_store.format_local(nxt)}\n\n"
+              "To change it, e.g.:\n"
+              "/schedule weekly monday 8\n/schedule daily 18\n/schedule 2w friday\n"
+              "/schedule monthly")
         return
 
-    days = parse_interval(arg)
-    if days is None:
+    changes = parse_schedule(arg, chats_store.get_interval_days(chat_id))
+    if changes is None:
         reply(f"Didn't understand '{arg.strip()}'.\n\n"
-              "Try: /schedule daily | weekly | 2w | 10d | monthly\n"
-              f"(anything from {chats_store.MIN_INTERVAL_DAYS} to "
-              f"{chats_store.MAX_INTERVAL_DAYS} days)")
+              "Try: /schedule weekly monday 8, /schedule daily 18, /schedule 2w friday, "
+              f"or /schedule monthly (1 to {chats_store.MAX_INTERVAL_DAYS} days)")
         return
 
-    chats_store.update_meta(chat_id, interval_days=days)
-    nxt = chats_store.next_due_at(chat_id)
-    reply(f"Done -- reports now go out {describe_interval(days)}.\n"
-          f"Next one due: {nxt:%Y-%m-%d %H:%M} UTC")
+    chats_store.update_meta(chat_id, **changes)
+    chats_store.mark_schedule_changed(chat_id)
+    reply(f"Done -- reports now go out {chats_store.describe_schedule(chat_id)}.\n"
+          f"Next one: {chats_store.format_local(chats_store.next_due_at(chat_id))}")
 
 
 def handle_pause(chat_id: str, reply) -> None:
@@ -335,9 +370,9 @@ def handle_pause(chat_id: str, reply) -> None:
 
 def handle_resume(chat_id: str, reply) -> None:
     chats_store.update_meta(chat_id, paused=False)
-    nxt = chats_store.next_due_at(chat_id)
-    reply(f"Resumed -- {describe_interval(chats_store.get_interval_days(chat_id))}.\n"
-          f"Next report due: {nxt:%Y-%m-%d %H:%M} UTC")
+    chats_store.mark_schedule_changed(chat_id)   # don't fire for slots missed while paused
+    reply(f"Resumed -- reports go out {chats_store.describe_schedule(chat_id)}.\n"
+          f"Next one: {chats_store.format_local(chats_store.next_due_at(chat_id))}")
 
 
 def handle_status(chat_id: str, reply) -> None:
@@ -348,12 +383,11 @@ def handle_status(chat_id: str, reply) -> None:
     lines = [
         f"Topics: {len(topics)} active" + (f" ({', '.join(t['name'] for t in topics[:5])}" +
                                             (", ..." if len(topics) > 5 else "") + ")" if topics else ""),
-        f"Schedule: {describe_interval(chats_store.get_interval_days(chat_id))}"
-        + (" -- PAUSED" if paused else ""),
-        f"Last report: {last:%Y-%m-%d %H:%M} UTC" if last else "Last report: none yet",
+        f"Schedule: {chats_store.describe_schedule(chat_id)}" + (" -- PAUSED" if paused else ""),
+        f"Last report: {chats_store.format_local(last)}" if last else "Last report: none yet",
     ]
     if not paused:
-        lines.append(f"Next report: {chats_store.next_due_at(chat_id):%Y-%m-%d %H:%M} UTC")
+        lines.append(f"Next report: {chats_store.format_local(chats_store.next_due_at(chat_id))}")
     reply("\n".join(lines))
 
 
@@ -432,9 +466,13 @@ def generate_report_now(chat_id: str, reply, scheduled: bool = False) -> None:
     try:
         if not scheduled:
             # Honest estimate: calls are paced under Groq's free-tier 8K tokens/minute,
-            # so a report with several topics spans a few minutes by design.
-            reply("Working on it -- searching for new papers. This usually takes 2-4 minutes.")
-        chats_store.mark_report_started(chat_id)
+            # so a report with several topics spans several minutes by design.
+            reply("Working on it -- searching for papers. This usually takes about 5 minutes.")
+        if scheduled:
+            chats_store.mark_scheduled_started(chat_id)
+        else:
+            # On-demand reports must not move the schedule -- see chats_store.SLOT_EPOCH.
+            chats_store.mark_report_started(chat_id)
         from datetime import date
         import run_reporter_cloud
         run_reporter_cloud.process_chat(chat_id, date.today().isoformat())

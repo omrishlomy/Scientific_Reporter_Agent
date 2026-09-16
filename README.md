@@ -86,8 +86,14 @@ and every "generate report" press waited hours. A persistent service has no such
    | `TIMEZONE` | `Asia/Jerusalem` (default) |
 
    There is deliberately no global schedule variable -- **each chat sets its own
-   interval** via `/schedule` (see below). The service just ticks hourly and sends to
-   whoever is due.
+   schedule** via `/schedule` (see below). The service checks every 10 minutes and sends
+   to whoever has a scheduled slot that passed without a report.
+
+   **Serverless must be OFF** for this service (Railway -> service -> Settings). Serverless
+   sleeps a service after ~5-10 minutes without outbound traffic, and while asleep the
+   in-process scheduler doesn't run: a Telegram message or button press wakes it, a
+   Monday 08:00 slot does not. The logs print a `heartbeat:` line every hour listing
+   each chat's next report -- if those lines have gaps, the service was asleep.
 
    `TELEGRAM_WEBHOOK_SECRET` matters: the webhook URL is public, and without a shared
    secret anyone who found it could POST fake updates to add topics or trigger reports.
@@ -120,26 +126,53 @@ is in play.
   `reporter/topic-draft-prompt.md`. Or use `/addtopic <name> | <exact query>` if you
   want to write the query yourself.
 - `/topics` lists that chat's topics, `/removetopic <name>` disables one.
-- **Each chat picks its own delivery interval** with `/schedule` -- `daily`, `weekly`
-  (default), `2w`, `10d`, `monthly`, anything from 1 to 90 days. `/pause` and `/resume`
-  stop and restart delivery without losing topics, and `/status` shows topics,
-  interval, and last/next report.
+- **Each chat sets its own schedule** with `/schedule` -- default every Monday 08:00
+  (Israel time). Interval, weekday and hour are all optional: `/schedule weekly
+  thursday 18`, `/schedule daily 7`, `/schedule 2w friday`, `/schedule monthly`.
+  `/pause` and `/resume` stop and restart delivery without losing topics, and
+  `/status` shows topics and last/next report.
 
-### Scheduling design: hourly due-check, not a cron per chat
+### Scheduling design: fixed calendar slots, checked every 10 minutes
 
-The service ticks hourly and asks each chat "are you overdue?", rather than registering
-a cron job per chat. Two reasons:
+Reports go out on **fixed calendar slots** (e.g. every Monday 08:00, every other
+Friday 18:00), counted from a fixed epoch -- not "N days after the last report".
+The first version used the latter, and it broke the obvious expectation: tapping
+"Generate report now" on a Saturday moved the weekly report to the following Saturday,
+so the Monday report never came. On-demand reports now never touch the schedule.
 
-- Chats change their own interval at runtime, so cron jobs would have to be added and
-  removed as users send `/schedule`.
-- A cron fire missed during a redeploy or restart is simply lost. A due-check
-  self-heals: a chat that came due while the service was down goes out on the next
-  tick instead of waiting a whole interval.
+Every 10 minutes the service asks each chat "has a slot passed that hasn't been
+reported?". That self-heals: a slot missed while the service was down or redeploying
+goes out on the next check, once. Changing the schedule or resuming from pause does
+not fire for slots that already passed -- the next report is the next slot. A chat
+that joins mid-week waits for its first slot.
 
-`last_report_at` is stamped when a run **begins**, not when it succeeds. If a run
-crashes halfway, that chat waits for its next interval rather than retrying the full
-pipeline on every tick -- a crash loop re-running an expensive job forever is a worse
-failure than one missed digest.
+The scheduled-run timestamp is stamped when a run **begins**, not when it succeeds. If
+a run crashes halfway, that slot is spent rather than re-running the full pipeline on
+every check -- a crash loop is a worse failure than one missed report.
+
+## What a report contains
+
+Files are named `<date> <kind> - <topics>`, e.g.
+`2026-09-16 NotebookLM source - Respiration and the brain, Disorders of Consciousness +2 more.md`.
+Sent to Telegram, in order:
+
+1. **Message** -- the written brief (cross-topic synthesis).
+2. **Infographic** -- one card per topic.
+3. **NotebookLM source** -- the comprehensive document, meant for NotebookLM's Audio
+   Overview: overview, per-topic background and how the papers connect, each paper
+   explained in plain language (question / approach / results / why it matters /
+   limitations), the full abstract, the paper's **full text** when it's open access
+   (Introduction, Results, Discussion, Conclusions; methods shortened; references and
+   declarations dropped), and a glossary. Roughly 30-40K words for a 30-paper week.
+4. **Paper list with links** -- titles, abstracts and links; the quick reading list.
+
+Full text comes from Europe PMC and only exists for open-access papers with a PMC id --
+typically a minority of a week's papers. The rest are covered from their abstract plus
+the plain-language notes, and the document says which is which.
+
+**Groq budget:** a report is ~5 model calls (~30K tokens) and takes about 5 minutes,
+paced under the free tier's 8K tokens/minute. The free tier's 200K tokens/day cap is
+shared by every chat using the bot -- roughly 6 full reports a day in total.
 - Each chat's state lives at `reporter/chats/<chat_id>/` (`topics.yaml`, `seen.json`,
   `meta.json`) -- dedup is per-chat on purpose: two chats interested in the same thing
   each still need to see a paper neither has been sent yet.

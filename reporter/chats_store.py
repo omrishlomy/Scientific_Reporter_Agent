@@ -15,7 +15,8 @@ import json
 import os
 import pathlib
 import shutil
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, time, timedelta, timezone
+from zoneinfo import ZoneInfo
 
 HERE = pathlib.Path(__file__).parent
 
@@ -88,8 +89,23 @@ def list_chat_ids() -> list[str]:
 
 DEFAULT_INTERVAL_DAYS = 7
 DEFAULT_HOUR = 8
+DEFAULT_WEEKDAY = 0            # Monday
 MIN_INTERVAL_DAYS = 1
 MAX_INTERVAL_DAYS = 90
+
+WEEKDAY_NAMES = ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday"]
+
+try:
+    LOCAL_TZ = ZoneInfo(os.environ.get("TIMEZONE", "Asia/Jerusalem"))
+except Exception:
+    LOCAL_TZ = timezone.utc
+
+# Scheduled reports land on fixed calendar slots counted from this Monday: weekly means
+# every Monday (or the chosen weekday) at the chosen hour, every-2-weeks means alternate
+# ones, and so on. The first version instead counted N days from the LAST report of any
+# kind, so tapping "Generate now" on a Saturday silently moved the weekly report to the
+# following Saturday -- the Monday report the user expected never came.
+SLOT_EPOCH = date(2024, 1, 1)
 
 
 def load_meta(chat_id: str) -> dict:
@@ -131,49 +147,120 @@ def get_hour(chat_id: str) -> int:
     return v if 0 <= v <= 23 else DEFAULT_HOUR
 
 
+def get_weekday(chat_id: str) -> int:
+    try:
+        v = int(load_meta(chat_id).get("weekday", DEFAULT_WEEKDAY))
+    except (TypeError, ValueError):
+        return DEFAULT_WEEKDAY
+    return v if 0 <= v <= 6 else DEFAULT_WEEKDAY
+
+
 def is_paused(chat_id: str) -> bool:
     return bool(load_meta(chat_id).get("paused", False))
 
 
-def last_report_at(chat_id: str) -> datetime | None:
-    raw = load_meta(chat_id).get("last_report_at")
+def _parse_ts(raw) -> datetime | None:
     if not raw:
         return None
     try:
-        return datetime.fromisoformat(raw)
-    except ValueError:
+        ts = datetime.fromisoformat(raw)
+    except (TypeError, ValueError):
         return None
+    return ts if ts.tzinfo else ts.replace(tzinfo=timezone.utc)
+
+
+def last_report_at(chat_id: str) -> datetime | None:
+    """Most recent report of any kind, scheduled or on demand. Display only -- it does
+    not affect when the next scheduled report goes out."""
+    return _parse_ts(load_meta(chat_id).get("last_report_at"))
+
+
+def _now() -> datetime:
+    return datetime.now(timezone.utc)
 
 
 def mark_report_started(chat_id: str) -> None:
-    """Stamped when a run BEGINS, not when it finishes. If a run crashes halfway, the
-    chat waits for its next interval instead of retrying on every scheduler tick --
-    a crash loop that re-ran an expensive pipeline forever would be far worse than
-    missing one digest."""
-    update_meta(chat_id, last_report_at=datetime.now(timezone.utc).isoformat())
+    """On-demand report. Deliberately leaves the schedule untouched."""
+    update_meta(chat_id, last_report_at=_now().isoformat())
 
 
-def next_due_at(chat_id: str) -> datetime:
-    """When this chat's next scheduled digest is due (UTC)."""
-    last = last_report_at(chat_id)
-    if last is None:
-        return datetime.now(timezone.utc)   # never sent -> due now
-    if last.tzinfo is None:
-        last = last.replace(tzinfo=timezone.utc)
-    return last + timedelta(days=get_interval_days(chat_id))
+def mark_scheduled_started(chat_id: str) -> None:
+    """Stamped when a scheduled run BEGINS, not when it finishes: a run that crashes
+    halfway costs that slot instead of re-running an expensive pipeline on every tick."""
+    stamp = _now().isoformat()
+    update_meta(chat_id, last_scheduled_at=stamp, last_report_at=stamp)
+
+
+def mark_schedule_changed(chat_id: str) -> None:
+    """Changing the schedule or resuming must not fire a report for a slot that already
+    passed -- the next report is the next slot from now."""
+    update_meta(chat_id, schedule_changed_at=_now().isoformat())
+
+
+def _slot(d: date, hour: int) -> datetime:
+    return datetime.combine(d, time(hour), tzinfo=LOCAL_TZ)
+
+
+def latest_slot(chat_id: str, now: datetime | None = None) -> datetime:
+    """The most recent scheduled slot at or before `now` (returned in UTC)."""
+    now = now or _now()
+    local_now = now.astimezone(LOCAL_TZ)
+    interval, hour = get_interval_days(chat_id), get_hour(chat_id)
+    anchor = SLOT_EPOCH + timedelta(days=get_weekday(chat_id))
+    d = anchor + timedelta(days=((local_now.date() - anchor).days // interval) * interval)
+    slot = _slot(d, hour)
+    if slot > local_now:
+        slot = _slot(d - timedelta(days=interval), hour)
+    return slot.astimezone(timezone.utc)
+
+
+def _baseline(chat_id: str) -> datetime | None:
+    """Slots at or before this moment are considered handled: the chat didn't exist yet,
+    a scheduled report already went out for them, or the schedule was changed after."""
+    meta = load_meta(chat_id)
+    stamps = [_parse_ts(meta.get(k)) for k in
+              ("registered_at", "last_scheduled_at", "schedule_changed_at")]
+    stamps = [s for s in stamps if s]
+    return max(stamps) if stamps else None
 
 
 def is_due(chat_id: str, now: datetime | None = None) -> bool:
+    """True when a scheduled slot has passed without a report. Because it compares
+    against the latest slot rather than an exact time, a slot missed while the service
+    was down or asleep still fires on the next tick instead of being skipped."""
     if is_paused(chat_id):
         return False
-    # Never reported: due immediately. Checked explicitly rather than via next_due_at,
-    # which returns "now" for this case -- and its now() is evaluated microseconds after
-    # the caller's, so `now >= next_due_at()` came out False and a brand new chat waited
-    # a whole tick for its first report.
-    if last_report_at(chat_id) is None:
-        return True
-    now = now or datetime.now(timezone.utc)
-    return now >= next_due_at(chat_id)
+    now = now or _now()
+    base = _baseline(chat_id)
+    return base is None or latest_slot(chat_id, now) > base
+
+
+def next_due_at(chat_id: str, now: datetime | None = None) -> datetime:
+    """When the next scheduled report goes out (UTC). If one is overdue, that slot."""
+    now = now or _now()
+    last = latest_slot(chat_id, now)
+    if is_due(chat_id, now):
+        return last
+    d = last.astimezone(LOCAL_TZ).date() + timedelta(days=get_interval_days(chat_id))
+    return _slot(d, get_hour(chat_id)).astimezone(timezone.utc)
+
+
+def describe_schedule(chat_id: str) -> str:
+    interval, hour, wd = get_interval_days(chat_id), get_hour(chat_id), get_weekday(chat_id)
+    at = f"at {hour:02d}:00"
+    if interval == 1:
+        return f"every day {at}"
+    if interval == 7:
+        return f"every {WEEKDAY_NAMES[wd]} {at}"
+    if interval == 14:
+        return f"every other {WEEKDAY_NAMES[wd]} {at}"
+    if interval % 7 == 0:
+        return f"every {interval // 7} weeks on {WEEKDAY_NAMES[wd]} {at}"
+    return f"every {interval} days {at}"
+
+
+def format_local(ts: datetime) -> str:
+    return ts.astimezone(LOCAL_TZ).strftime("%a %d %b, %H:%M")
 
 
 def seed_from_bundle() -> int:
